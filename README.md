@@ -4,25 +4,26 @@
 
 ## 效果示例
 
-> **家居文档整理系统：Reddit 买家痛点深度研究**
+> **女士钱包：Reddit 买家痛点深度研究**
 >
-> **机会评分：8.5/10**
+> **机会评分：6/10**（需求真实性 2/3，市场空间 2/3，差异化可行性 2/4）
 >
-> ### 痛点一：房屋交接信息断层导致维修成本激增
-> r/HomeImprovement「Previous owner left a binder in the garage」（69,271赞 / 1,245评）
-> "I was already mentally preparing for an HVAC bill... until I remembered the binder in the garage."
+> **数据依据**：14 个帖子 / 共 112 条评论，其中 5 篇帖子（累计 734赞）明确提及材质脱皮/变形问题。
+>
+> ### 痛点一：钱包在数月内鼓胀变形或开裂脱皮
+> r/BuyItForLife「Best wallets for women that actually last」（223赞 / 176评）
+> "I am tired of going through womens wallets that either become bulky or start falling apart after a short time."
 >
 > ### 机会点
-> ① 实体"房屋护照"套装（精装活页夹 + 预印分类模板 + 二维码数字版），定价 $39.99
-> ② 房产中介白标版"交接礼包"，B2B 批发 $15-25/套
+> ① 植鞣全粒面皮革，厚度 ≥1.2mm，手工缝线（非胶粘），定价 $45-65
+> ② 卡槽内衬改为光面黄铜/尼龙，消除卡片卡顿，作为核心产品页面卖点
 
 ## 工作原理
 
-1. 从多个 subreddit 抓取热帖（无需 Reddit API Key，通过本地 Chrome cookies 访问）
-2. 取评论数最多的 20 个帖子，抓取高赞评论
-3. 由 Claude 自主识别最有价值的产品机会，生成 1000+ 字深度报告
-
-报告结构参考 noinoi 风格：**多个具体痛点 + 用户原话引用 + 产品规格建议 + 竞品分析 + 机会评分 + 买家画像**。
+1. 两种模式：**宽泛模式**（自动发现机会）或**定向模式**（指定产品方向）
+2. 无需 Reddit API Key，通过本地 Chrome cookies 访问
+3. Claude 规划搜索策略 → 抓取热帖+高赞评论 → 深度分析买家痛点
+4. 机会评分要求列出具体数据（帖子数、评论数、赞数），不凭感觉打分
 
 ## 安装
 
@@ -45,26 +46,27 @@ pip install browser_cookie3 anthropic
 
 > "跑一次选品分析"
 > "帮我做 Reddit 选品，重点看宠物用品"
-> "用 opus 模型跑一次深度选品分析"
+> "用 opus 模型分析一下女士钱包"
 
 Claude 会自动调用脚本，完成后输出完整报告。
 
 也可以直接运行脚本：
 
 ```bash
-# 默认（claude-sonnet，质量/成本均衡）
+# 宽泛模式（自动发现机会，默认 claude-sonnet）
 python3 scripts/scout.py
 
-# 更深度分析
-python3 scripts/scout.py --model claude-opus-4-7
+# 定向模式（指定产品方向）
+python3 scripts/scout.py --product "女士钱包"
+python3 scripts/scout.py -p "women's wallet" --model claude-opus-4-7
 
-# 快速便宜
-python3 scripts/scout.py --model claude-haiku-4-5-20251001
+# 指定输出目录（默认 ~/reddit-scout-reports/）
+python3 scripts/scout.py -p "pet carrier" --output ~/my-reports/
 ```
 
-## 配置 Subreddit
+## 配置宽泛模式的 Subreddit
 
-修改 `scripts/scout.py` 顶部的 `SUBREDDITS` 变量，`references/subreddits.md` 里有按品类整理的推荐组合：
+修改 `scripts/scout.py` 顶部的 `BROAD_SUBREDDITS` 变量，`references/subreddits.md` 里有按品类整理的推荐组合：
 
 | 品类 | 推荐组合 |
 |------|---------|
@@ -73,6 +75,19 @@ python3 scripts/scout.py --model claude-haiku-4-5-20251001
 | 健身/户外 | Fitness + running + camping + HydroHomies |
 | 厨房/食品 | Cooking + MealPrepSunday + Frugal |
 | 育儿 | Parenting + beyondthebump + BuyItForLife |
+| 女性时尚 | femalefashionadvice + handbags + BuyItForLife |
+
+## 关于机会评分
+
+评分**严格基于本次抓取的数据**，报告中会列出评分依据表格：
+
+| 维度 | 得分 | 数据依据 |
+|------|------|---------|
+| 需求真实性 | X/3 | 明确提及该痛点的帖子数、评论数、总赞数 |
+| 市场空间 | X/3 | 搜索结果密度、版块规模 |
+| 差异化可行性 | X/4 | 竞品缺陷引用 vs 改进方案可行性 |
+
+并附"诚实声明"：Reddit 讨论量不等于市场规模，评分仅反映 Reddit 上的声音。
 
 ## 可选：推送到飞书
 

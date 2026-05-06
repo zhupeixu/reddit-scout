@@ -2,17 +2,31 @@
 """
 Reddit 选品侦察（统一版）
 
-两种模式：
-  # 宽泛模式：自动从多个版块抓取热帖，让 Claude 自主选出最有价值的产品机会
+三种模式：
+  # 宽泛模式：自动从多个版块抓取热帖，让 Claude 自主选出 1 个最有价值的产品机会
   python3 scout.py
 
-  # 定向模式：指定产品方向，让 Claude 规划搜索策略，深度分析买家痛点
+  # 定向模式：指定产品方向，让 Claude 规划搜索策略，深度分析买家痛点（输出 1 个产品）
   python3 scout.py --product "女士钱包"
   python3 scout.py -p "women's wallet" --model claude-opus-4-7
+
+  # 周报模式：横扫多个品类，输出 5+ 个不同方向的产品机会
+  python3 scout.py --weekly
+
+  # 自动推送到飞书（创建文档 + 多维表入库）
+  python3 scout.py --weekly --bitable
+  python3 scout.py -p "女士钱包" --bitable
 """
-import json, subprocess, time, datetime, argparse, urllib.parse, os
+import json, subprocess, time, datetime, argparse, urllib.parse, os, re
 import browser_cookie3
 import anthropic
+
+# ── 飞书多维表格配置（默认值，可用 ~/.reddit-scout.json 覆盖）────
+DEFAULT_BITABLE = {
+    "base_token": "Jr25bCOJeaL8gGsqRmVcjbt0njb",
+    "table_research": "tblz8whHv2l88kAG",   # 选品记录
+    "table_posts": "tblFestqjfCZ2fwE",       # Reddit热帖
+}
 
 # ── 默认配置 ────────────────────────────────────────────────────
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -30,6 +44,22 @@ BROAD_SUBREDDITS = [
 ]
 BROAD_POSTS_PER_SUB = 15
 
+# 周报模式：横向覆盖 10 个品类
+WEEKLY_SUBREDDITS = [
+    ("BuyItForLife", "top", "week"),
+    ("HomeImprovement", "hot", None),
+    ("Frugal", "top", "week"),
+    ("Cooking", "hot", None),
+    ("Parenting", "hot", None),
+    ("dogs", "hot", None),
+    ("camping", "top", "week"),
+    ("femalefashionadvice", "top", "week"),
+    ("malelivingspace", "top", "week"),
+    ("declutter", "top", "month"),
+]
+WEEKLY_POSTS_PER_SUB = 12
+WEEKLY_TOP_POSTS = 30
+
 # 定向模式：每个关键词的搜索帖数
 TARGETED_POSTS_PER_SEARCH = 10
 # ─────────────────────────────────────────────────────────────────
@@ -37,12 +67,29 @@ TARGETED_POSTS_PER_SEARCH = 10
 client = anthropic.Anthropic()
 
 
+def load_bitable_config():
+    config_path = os.path.expanduser("~/.reddit-scout.json")
+    cfg = dict(DEFAULT_BITABLE)
+    if os.path.exists(config_path):
+        try:
+            cfg.update(json.load(open(config_path)))
+        except Exception:
+            pass
+    return cfg
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Reddit 选品侦察工具")
     parser.add_argument(
         "--product", "-p",
         default=None,
-        help="定向模式：指定产品方向，如 '女士钱包' 或 \"women's wallet\"。不填则进入宽泛模式。",
+        help="定向模式：指定产品方向，如 '女士钱包'。不填且不带 --weekly 则进入宽泛模式。",
+    )
+    parser.add_argument(
+        "--weekly", "-w",
+        action="store_true",
+        default=False,
+        help="周报模式：横扫多品类，输出 5+ 个不同方向的产品机会。",
     )
     parser.add_argument(
         "--model", "-m",
@@ -53,6 +100,12 @@ def parse_args():
         "--output", "-o",
         default=None,
         help="报告保存路径（默认：~/reddit-scout-reports/）",
+    )
+    parser.add_argument(
+        "--bitable", "-b",
+        action="store_true",
+        default=False,
+        help="自动创建飞书文档 + 推送结果到多维表格（需已配置 lark-cli）",
     )
     return parser.parse_args()
 
@@ -81,8 +134,10 @@ def reddit_get(url, cookie_str):
         return None
 
 
-def fetch_posts_from_sub(sub, sort, timeframe, cookie_str, limit=BROAD_POSTS_PER_SUB):
-    """宽泛模式：按版块抓取热帖"""
+def fetch_posts_from_sub(sub, sort, timeframe, cookie_str, limit=None):
+    """按版块抓取热帖"""
+    if limit is None:
+        limit = BROAD_POSTS_PER_SUB
     url = f"https://www.reddit.com/r/{sub}/{sort}.json?limit={limit}"
     if timeframe:
         url += f"&t={timeframe}"
@@ -104,7 +159,7 @@ def fetch_posts_from_sub(sub, sort, timeframe, cookie_str, limit=BROAD_POSTS_PER
 
 
 def search_reddit(keyword, subreddit=None, cookie_str="", limit=TARGETED_POSTS_PER_SEARCH):
-    """定向模式：关键词搜索帖子，可限定 subreddit"""
+    """关键词搜索帖子，可限定 subreddit"""
     q = urllib.parse.quote(keyword)
     if subreddit:
         url = f"https://www.reddit.com/r/{subreddit}/search.json?q={q}&sort=top&t=year&limit={limit}&restrict_sr=1"
@@ -200,6 +255,54 @@ SCORING_INSTRUCTIONS = """
 """
 
 
+def bitable_json_instruction(num_opportunities):
+    """生成"在报告末尾追加 BITABLE_DATA JSON 块"的 prompt 段落"""
+    return f"""
+
+---
+
+**最重要：报告最末尾必须追加一个 BITABLE_DATA JSON 块**（用 HTML 注释包裹，markdown 渲染时不显示，但程序可解析），用于自动入库飞书多维表格。格式严格如下：
+
+<!--BITABLE_DATA
+{{
+  "opportunities": [
+    {{
+      "product_name": "产品中文名",
+      "category": "品类（如 厨房/家居/服饰）",
+      "score": 8.5,
+      "demand_score": 2.5,
+      "market_score": 3,
+      "diff_score": 3,
+      "pain_summary": "核心痛点 1-2 句话总结",
+      "opportunity_summary": "机会点 1-2 句话总结（具体规格/材质/做法/定价）",
+      "competition_summary": "竞品现状 1-2 句话",
+      "buyer_persona": "目标用户 1-2 句话",
+      "subreddits": "覆盖版块（如 r/Cooking, r/BuyItForLife）",
+      "selected_posts": 1,
+      "notes": "评分依据：本次数据 N 帖 / M 评论 / 累计 K 赞讨论；样本规模声明",
+      "evidence_posts": [
+        {{
+          "title": "Reddit 帖子标题原文",
+          "subreddit": "r/X",
+          "score": 100,
+          "num_comments": 50,
+          "top_comments": "(高赞数)评论原文1 | (高赞数)评论原文2",
+          "summary": "帖子主题 1 句话摘要"
+        }}
+      ]
+    }}
+  ]
+}}
+-->
+
+JSON 严格要求：
+- 顶层 opportunities 数组**必须包含 {num_opportunities} 个对象**
+- 所有数字字段（score / demand_score / market_score / diff_score / score / num_comments / selected_posts）**不带引号**
+- 每个 opportunity 至少 1 条 evidence_posts，最多 3 条
+- product_name 和 category 用中文，title 用英文原文
+- JSON 必须能被 json.loads 解析（注意双引号转义、不能有多余逗号）"""
+
+
 def analyze_broad(posts_with_comments, model):
     """宽泛模式：Claude 自主选出最有价值的产品机会并深度分析"""
     combined = build_post_texts(posts_with_comments)
@@ -213,58 +316,43 @@ def analyze_broad(posts_with_comments, model):
     prompt = f"""你是一名资深跨境电商选品分析师。以下是来自多个 Reddit 版块的真实用户讨论（共 {len(posts_with_comments)} 个帖子，约 {total_comments} 条评论）。
 
 **你的任务**：
-1. 从这些数据中**自主识别**最有价值的产品机会（不限定品类，只看讨论中真实暴露的痛点）
+1. 从这些数据中**自主识别** 1 个最有价值的产品机会
 2. 对该机会进行深度分析
 
-**输出格式**（严格按此格式，不要添加"你想让我"或"选A/B"等交互内容）：
+**输出格式**（严格按此格式）：
 
 ---
 
 ## [产品名称]：Reddit 买家痛点深度研究
 
-**品类背景**
-（2-3句：为什么这个品类值得研究，市场感知规模，核心用户群）
+**品类背景**（2-3句）
 
-### 痛点一：[具体痛点标题]
-（痛点本质 + 具体 Reddit 证据：r/XX，「帖子标题」（X赞 / X评）+ 用户原话引用 + 市场分析）
+### 痛点一：[标题]
+（痛点本质 + Reddit 证据：r/XX，「帖子标题」（X赞 / X评）+ 用户原话引用 + 市场分析）
 
-### 痛点二：[具体痛点标题]
-（同上）
-
-### 痛点三：[具体痛点标题]
-（同上）
-
-### 痛点四：[具体痛点标题]（如有）
-（同上）
+### 痛点二/三/四（如有）
 
 ## 机会点
-
-① [具体产品改进方向]
-（具体材质/尺寸/设计细节 + 制造可行性 + 产品页面卖点文案方向）
-
-② [具体产品改进方向]
-
-③ [具体产品改进方向]（如有）
+① 具体方向（材质/尺寸/制造可行性/卖点）
+② ...
+③ ...
 
 ## 竞品现状
-（现有主要竞品、定价区间、市场缺口）
 
 {scoring_block}
 
 ## 目标买家画像
-（核心人群、购买动机、价格敏感度、触达渠道）
 
 ## 本次研究数据
-（覆盖版块、扫描帖子数、精选讨论数、关键词范围）
 
 ---
 
 **重要约束**：
-- 只分析数据中**真实出现**的讨论和痛点，不要虚构
+- 只分析数据中真实出现的痛点，不要虚构
 - 每个痛点必须有具体帖子+赞数+用户原话作为证据
-- 机会评分必须用上方表格中的数据支撑，不允许"感觉很强烈"式的打分
-- 机会点要有具体规格/材质/做法，不要笼统建议
+- 机会评分必须用上方表格中的数据支撑
 - 整体不少于 1000 字
+{bitable_json_instruction(1)}
 
 以下是 Reddit 原始数据：
 
@@ -274,7 +362,7 @@ def analyze_broad(posts_with_comments, model):
     print(f"\n🤖 正在进行深度分析（模型：{model}）...\n")
     full_text = ""
     with client.messages.stream(
-        model=model, max_tokens=6000,
+        model=model, max_tokens=8000,
         messages=[{"role": "user", "content": prompt}]
     ) as stream:
         for text in stream.text_stream:
@@ -304,49 +392,30 @@ def analyze_targeted(posts_with_comments, product, model):
 
 ## {product}：Reddit 买家痛点深度研究
 
-**品类背景**
-（2-3句：市场规模感知、核心用户群、为什么值得研究）
+**品类背景**（2-3句）
 
-### 痛点一：[具体痛点标题]
+### 痛点一/二/三/四：[标题]
 （痛点本质 + Reddit 证据：r/XX，「帖子标题」（X赞/X评）+ 用户原话引用 + 市场分析）
 
-### 痛点二：[具体痛点标题]
-（同上）
-
-### 痛点三：[具体痛点标题]
-（同上）
-
-### 痛点四：[具体痛点标题]（如有）
-（同上）
-
-## 机会点
-
-① [具体改进方向]
-（材质/尺寸/设计细节 + 制造可行性 + 产品页面卖点方向）
-
-② [具体改进方向]
-
-③ [具体改进方向]（如有）
+## 机会点 ①②③（具体规格/材质/做法/定价）
 
 ## 竞品现状
-（现有主要竞品、定价区间、市场缺口）
 
 {scoring_block}
 
 ## 目标买家画像
-（人群/购买动机/价格敏感度/触达渠道）
 
 ## 本次研究数据
-（覆盖版块 / 搜索关键词数 / 扫描帖数 / 精选讨论数）
 
 ---
 
 要求：
 - 只分析数据中真实出现的痛点，不要虚构
-- 每个痛点必须有具体 Reddit 帖子作为证据（帖子标题+赞数+评论数+用户原话）
-- 机会评分必须用上方表格中的数据支撑——明确列出本次数据中有多少帖子、多少评论、多少赞在讨论该痛点，不允许用模糊的"讨论热烈"代替数字
+- 每个痛点必须有具体 Reddit 帖子作为证据
+- 机会评分必须用上方表格中的数据支撑
 - 机会点要具体可执行（有具体规格/材质/做法）
 - 整体不少于 1000 字
+{bitable_json_instruction(1)}
 
 以下是 Reddit 原始数据：
 
@@ -356,7 +425,7 @@ def analyze_targeted(posts_with_comments, product, model):
     print(f"\n🤖 深度分析中（模型：{model}）...\n")
     full_text = ""
     with client.messages.stream(
-        model=model, max_tokens=6000,
+        model=model, max_tokens=8000,
         messages=[{"role": "user", "content": prompt}]
     ) as stream:
         for text in stream.text_stream:
@@ -365,6 +434,200 @@ def analyze_targeted(posts_with_comments, product, model):
     print("\n")
     return full_text
 
+
+def analyze_weekly(posts_with_comments, model):
+    """周报模式：识别 5+ 个不同方向的产品机会"""
+    combined = build_post_texts(posts_with_comments)
+    total_comments = sum(len(p.get('comments', [])) for p in posts_with_comments)
+    today = datetime.date.today().isoformat()
+
+    prompt = f"""你是一名资深跨境电商选品分析师，正在做本周的 Reddit 选品周报。
+
+以下是从 10 个不同品类版块收集的 {len(posts_with_comments)} 篇帖子和约 {total_comments} 条高赞评论。
+
+**你的任务**：识别出 **5 个不同方向、不同品类**的产品机会（不要 5 个都是家居或厨房）。
+
+**严格要求**：
+- 每个机会必须有具体 Reddit 帖子作为证据（标题/赞数/评论数/原话）
+- 评分基于实际数据（多少帖子讨论、多少赞）
+- 不允许虚构数据里没出现的内容
+- 5 个机会必须横跨不同品类
+
+**输出格式**：
+
+# Reddit 选品周报（{today}）
+
+**本周扫描**：10 个版块 / {len(posts_with_comments)} 帖 / {total_comments} 条评论
+
+**核心发现**：1-2 句总结本周最值得关注的趋势
+
+---
+
+## 机会 1：[产品名]（品类：xx）
+**痛点核心**（1 句话）
+**Reddit 证据**（r/X「标题」（X赞/X评）+ 原话引用）
+**产品方向**（具体规格/材质/做法/定价）
+**机会评分**：X/10（数据依据：N 篇帖子 / M 条评论 / 累计 K 赞；竞品定价；差异化空间）
+
+---
+
+## 机会 2-5：[同结构]
+
+---
+
+## 本周次级信号（值得继续观察）
+- 信号一：简短描述 + 来源
+- 信号二：...
+- 信号三（如有）
+
+---
+
+## 数据声明
+本次样本为 {len(posts_with_comments)} 帖 / {total_comments} 条评论；产品立项前必须做亚马逊/阿里巴巴竞品对比、目标用户访谈等市场验证。
+{bitable_json_instruction(5)}
+
+以下是 Reddit 原始数据：
+
+{combined[:22000]}
+"""
+
+    print(f"\n🤖 生成周报中（模型：{model}）...\n")
+    full_text = ""
+    with client.messages.stream(
+        model=model, max_tokens=10000,
+        messages=[{"role": "user", "content": prompt}]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_text += text
+    print("\n")
+    return full_text
+
+
+# ── 飞书多维表格自动推送 ────────────────────────────────────────
+
+def extract_bitable_data(report_text):
+    """从报告末尾的 HTML 注释块解析 BITABLE_DATA JSON"""
+    match = re.search(r'<!--BITABLE_DATA\s*(\{.*?\})\s*-->', report_text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError as e:
+        print(f"⚠️  BITABLE_DATA JSON 解析失败：{e}")
+        return None
+
+
+def create_feishu_doc(title, markdown_content):
+    """通过 lark-cli 创建飞书文档，返回 doc_url"""
+    print(f"📄 创建飞书文档：{title}", flush=True)
+    r = subprocess.run(
+        ["lark-cli", "docs", "+create", "--title", title, "--markdown", markdown_content],
+        capture_output=True, text=True
+    )
+    raw = r.stdout
+    # docs +create 可能输出 [deprecated] 警告行，从首个 { 开始截取
+    start = raw.find('{')
+    if start < 0:
+        print(f"❌ 飞书文档创建失败：{raw[:300]}")
+        return None
+    try:
+        d = json.loads(raw[start:])
+        if d.get("ok"):
+            url = d["data"]["doc_url"]
+            print(f"   → {url}", flush=True)
+            return url
+    except json.JSONDecodeError:
+        pass
+    print(f"❌ 飞书文档创建失败：{raw[:300]}")
+    return None
+
+
+def push_record(base_token, table_id, payload, record_id=None):
+    """通过 lark-cli 创建/更新一条多维表记录，返回 record_id"""
+    cmd = ["lark-cli", "base", "+record-upsert",
+           "--base-token", base_token, "--table-id", table_id,
+           "--json", json.dumps(payload, ensure_ascii=False)]
+    if record_id:
+        cmd[3:3] = ["--record-id", record_id]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        d = json.loads(r.stdout)
+        if not d.get("ok"):
+            return None
+        return d["data"]["record"].get("record_id") or record_id
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def push_to_bitable(report_text, mode, input_direction, doc_url, scan_summary):
+    """解析报告末尾 JSON，推送 N 条机会到选品记录表，关联证据帖到 Reddit热帖表"""
+    data = extract_bitable_data(report_text)
+    if not data or "opportunities" not in data:
+        print("⚠️  报告里没有可解析的 BITABLE_DATA 数据，跳过推送")
+        return None
+
+    cfg = load_bitable_config()
+    base = cfg["base_token"]
+    t1 = cfg["table_research"]
+    t2 = cfg["table_posts"]
+
+    today = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    mode_label = {"weekly": "周报", "broad": "宽泛", "targeted": "定向"}.get(mode, "宽泛")
+
+    opps = data["opportunities"]
+    print(f"\n📤 推送 {len(opps)} 个机会到飞书多维表格…", flush=True)
+    pushed_records = []
+
+    for i, opp in enumerate(opps, 1):
+        record = {
+            "产品名称": opp.get("product_name", "?"),
+            "分析日期": today,
+            "分析模式": mode_label,
+            "输入方向": input_direction,
+            "机会评分": opp.get("score"),
+            "需求真实性": opp.get("demand_score"),
+            "市场空间": opp.get("market_score"),
+            "差异化可行性": opp.get("diff_score"),
+            "核心痛点": opp.get("pain_summary"),
+            "机会点": opp.get("opportunity_summary"),
+            "竞品现状": opp.get("competition_summary"),
+            "覆盖版块": opp.get("subreddits"),
+            "扫描帖数": scan_summary.get("posts_scanned"),
+            "精选帖数": opp.get("selected_posts"),
+            "跟进状态": "待评估",
+            "飞书文档": doc_url,
+            "备注": opp.get("notes"),
+        }
+        rid = push_record(base, t1, record)
+        if rid:
+            print(f"  ✅ [{i}/{len(opps)}] 选品记录: {opp.get('product_name')} → {rid}")
+            pushed_records.append((rid, opp))
+        else:
+            print(f"  ❌ [{i}/{len(opps)}] 选品记录失败: {opp.get('product_name')}")
+
+    # 推送证据帖到 Reddit热帖 表
+    post_count = 0
+    for rid, opp in pushed_records:
+        for ep in opp.get("evidence_posts", []) or []:
+            post_payload = {
+                "帖子标题": ep.get("title"),
+                "版块": ep.get("subreddit"),
+                "赞数": ep.get("score"),
+                "评论数": ep.get("num_comments"),
+                "高赞评论": ep.get("top_comments"),
+                "帖子摘要": ep.get("summary"),
+                "发现日期": today,
+                "关联研究": [{"id": rid}],
+            }
+            if push_record(base, t2, post_payload):
+                post_count += 1
+
+    print(f"📤 完成：{len(pushed_records)} 条选品记录 + {post_count} 条证据帖", flush=True)
+    return pushed_records
+
+
+# ── 主流程 ───────────────────────────────────────────────────────
 
 def save_report(report, label, output_dir=None):
     if output_dir is None:
@@ -378,8 +641,25 @@ def save_report(report, label, output_dir=None):
     return path
 
 
-def run_broad_mode(cookie_str, model, output_dir):
-    """宽泛模式主流程"""
+def maybe_push_to_lark(report_text, args, mode, input_direction, label, scan_summary):
+    """如果 --bitable 开启：创建飞书文档 + 推送多维表"""
+    if not args.bitable:
+        return
+    today_str = datetime.date.today().isoformat()
+    title_map = {
+        "weekly": f"Reddit 选品周报 ({today_str})",
+        "broad": f"Reddit 选品分析 - 宽泛模式 ({today_str})",
+        "targeted": f"Reddit 选品分析 - {input_direction} ({today_str})",
+    }
+    doc_url = create_feishu_doc(title_map.get(mode, label), report_text)
+    if not doc_url:
+        print("⚠️  跳过多维表推送（飞书文档创建失败）")
+        return
+    push_to_bitable(report_text, mode, input_direction, doc_url, scan_summary)
+
+
+def run_broad_mode(cookie_str, args):
+    print("🌐 宽泛模式：自动发现产品机会", flush=True)
     all_posts = []
     for sub, sort, timeframe in BROAD_SUBREDDITS:
         print(f"📥 抓取 r/{sub} ({sort}/{timeframe or 'hot'})...", end=" ", flush=True)
@@ -388,47 +668,41 @@ def run_broad_mode(cookie_str, model, output_dir):
         all_posts.extend(posts)
         time.sleep(1.5)
 
-    # 去重
     seen, unique = set(), []
     for p in all_posts:
         if p['id'] not in seen:
-            seen.add(p['id'])
-            unique.append(p)
+            seen.add(p['id']); unique.append(p)
     all_posts = unique
-    print(f"\n共 {len(all_posts)} 篇帖子（去重后）", flush=True)
+    print(f"\n共 {len(all_posts)} 篇帖子（去重后）")
 
-    # 过滤：跳过通用闲聊帖（AskReddit 风格，无具体产品痛点迹象）
-    # 取评论数前 N，但排除纯问答/无产品内容的帖子
     SKIP_TITLE_PATTERNS = ['what is', 'who is', 'what are', 'am i', 'eli5', 'megathread', 'weekly']
-    def likely_product_discussion(p):
-        title_lower = p['title'].lower()
-        if any(pat in title_lower for pat in SKIP_TITLE_PATTERNS):
-            return False
-        return True
-
-    filtered = [p for p in all_posts if likely_product_discussion(p)]
+    filtered = [p for p in all_posts
+                if not any(pat in p['title'].lower() for pat in SKIP_TITLE_PATTERNS)]
     hot_posts = sorted(filtered, key=lambda x: x['num_comments'], reverse=True)[:MAX_POSTS_FOR_ANALYSIS]
-    print(f"\n📖 抓取前 {len(hot_posts)} 个高热度帖子的评论...\n", flush=True)
+    print(f"\n📖 抓取前 {len(hot_posts)} 个高热度帖子的评论...\n")
 
-    posts_with_comments = []
+    pwc = []
     for p in hot_posts:
-        print(f"  💬 [{p['num_comments']}评] r/{p['subreddit']} — {p['title'][:65]}...", flush=True)
-        comments = fetch_comments(p['id'], p['subreddit'], cookie_str)
-        p['comments'] = comments
-        posts_with_comments.append(p)
+        print(f"  💬 [{p['num_comments']}评] r/{p['subreddit']} — {p['title'][:65]}", flush=True)
+        p['comments'] = fetch_comments(p['id'], p['subreddit'], cookie_str)
+        pwc.append(p)
         time.sleep(0.8)
 
-    report = analyze_broad(posts_with_comments, model)
-    path = save_report(report, "broad", output_dir)
-    print(f"✅ 报告已保存：{path}", flush=True)
+    report = analyze_broad(pwc, args.model)
+    path = save_report(report, "broad", args.output)
+    print(f"✅ 报告已保存：{path}")
+
+    scan = {"posts_scanned": len(pwc),
+            "comments_analyzed": sum(len(p.get('comments', [])) for p in pwc),
+            "subreddits": [s[0] for s in BROAD_SUBREDDITS]}
+    maybe_push_to_lark(report, args, "broad", "宽泛-自动发现", "broad", scan)
 
 
-def run_targeted_mode(product, cookie_str, model, output_dir):
-    """定向模式主流程"""
-    print(f"🎯 目标产品：{product}", flush=True)
+def run_targeted_mode(cookie_str, args):
+    product = args.product
+    print(f"🎯 目标产品：{product}")
 
-    # Step 1: 规划搜索策略
-    plan = plan_search(product, model)
+    plan = plan_search(product, args.model)
     subreddits = plan.get("subreddits", [])
     keywords = plan.get("keywords", [])
     filter_words = plan.get("filter_words", [])
@@ -436,78 +710,102 @@ def run_targeted_mode(product, cookie_str, model, output_dir):
     print(f"🔍 关键词: {', '.join(keywords)}")
     print(f"🏷️  过滤词: {', '.join(filter_words)}\n")
 
-    # Step 2: 搜索帖子
     all_posts, seen = [], set()
-
-    # 在每个 subreddit 内搜索前两个关键词
     for sub in subreddits:
         for kw in keywords[:2]:
             print(f"  🔍 r/{sub} ← \"{kw}\"...", end=" ", flush=True)
             posts = search_reddit(kw, subreddit=sub, cookie_str=cookie_str)
             new = [p for p in posts if p['id'] not in seen]
-            for p in new:
-                seen.add(p['id'])
+            for p in new: seen.add(p['id'])
             all_posts.extend(new)
             print(f"{len(new)} 帖", flush=True)
             time.sleep(1.2)
-
-    # 全站搜索剩余关键词
     for kw in keywords[2:]:
         print(f"  🌐 全站 ← \"{kw}\"...", end=" ", flush=True)
         posts = search_reddit(kw, cookie_str=cookie_str)
         new = [p for p in posts if p['id'] not in seen]
-        for p in new:
-            seen.add(p['id'])
+        for p in new: seen.add(p['id'])
         all_posts.extend(new)
         print(f"{len(new)} 帖", flush=True)
         time.sleep(1.2)
-
     print(f"\n共找到 {len(all_posts)} 篇帖子（去重后）")
 
-    # Step 3: 过滤不相关帖
     if filter_words:
-        def is_relevant(p):
-            text = (p['title'] + ' ' + p['selftext']).lower()
-            return any(w.lower() in text for w in filter_words)
-        relevant = [p for p in all_posts if is_relevant(p)]
-        print(f"相关帖（含核心词 {filter_words}）：{len(relevant)} 篇 / 共 {len(all_posts)} 篇")
+        relevant = [p for p in all_posts
+                    if any(w.lower() in (p['title'] + ' ' + p['selftext']).lower() for w in filter_words)]
+        print(f"相关帖（含核心词 {filter_words}）：{len(relevant)} / {len(all_posts)}")
     else:
         relevant = all_posts
-        print("（未设置过滤词，使用全部帖子）")
-
-    # 优先用目标 subreddit 内的帖子，再按评论数排序
     target_subs = set(s.lower() for s in subreddits)
-    relevant.sort(key=lambda x: (
-        0 if x['subreddit'].lower() in target_subs else 1,
-        -x['num_comments']
-    ))
+    relevant.sort(key=lambda x: (0 if x['subreddit'].lower() in target_subs else 1, -x['num_comments']))
 
-    hot_posts = relevant[:MAX_POSTS_FOR_ANALYSIS]
-    print(f"\n📖 抓取前 {len(hot_posts)} 帖评论...\n")
-
-    posts_with_comments = []
-    for p in hot_posts:
-        print(f"  💬 [{p['num_comments']}评] r/{p['subreddit']} — {p['title'][:60]}...", flush=True)
-        comments = fetch_comments(p['id'], p['subreddit'], cookie_str)
-        p['comments'] = comments
-        posts_with_comments.append(p)
+    hot = relevant[:MAX_POSTS_FOR_ANALYSIS]
+    print(f"\n📖 抓取前 {len(hot)} 帖评论...\n")
+    pwc = []
+    for p in hot:
+        print(f"  💬 [{p['num_comments']}评] r/{p['subreddit']} — {p['title'][:60]}", flush=True)
+        p['comments'] = fetch_comments(p['id'], p['subreddit'], cookie_str)
+        pwc.append(p)
         time.sleep(0.8)
 
-    # Step 4: 深度分析
-    report = analyze_targeted(posts_with_comments, product, model)
-    path = save_report(report, product, output_dir)
-    print(f"✅ 报告已保存：{path}", flush=True)
+    report = analyze_targeted(pwc, product, args.model)
+    path = save_report(report, product, args.output)
+    print(f"✅ 报告已保存：{path}")
+
+    scan = {"posts_scanned": len(pwc),
+            "comments_analyzed": sum(len(p.get('comments', [])) for p in pwc),
+            "subreddits": subreddits}
+    maybe_push_to_lark(report, args, "targeted", product, product, scan)
+
+
+def run_weekly_mode(cookie_str, args):
+    print("📰 周报模式：横扫多品类，输出 5+ 个产品机会\n")
+    all_posts = []
+    for sub, sort, tf in WEEKLY_SUBREDDITS:
+        print(f"📥 r/{sub} ({sort}/{tf or 'hot'})...", end=" ", flush=True)
+        posts = fetch_posts_from_sub(sub, sort, tf, cookie_str, limit=WEEKLY_POSTS_PER_SUB)
+        print(f"{len(posts)} 帖", flush=True)
+        all_posts.extend(posts)
+        time.sleep(1.2)
+
+    seen, uniq = set(), []
+    for p in all_posts:
+        if p['id'] not in seen:
+            seen.add(p['id']); uniq.append(p)
+    SKIP = ['what is', 'who is', 'am i', 'eli5', 'megathread', 'weekly thread', 'daily']
+    all_posts = [p for p in uniq if not any(pat in p['title'].lower() for pat in SKIP)]
+    print(f"\n共 {len(all_posts)} 篇有效帖子（去重+过滤后）")
+
+    hot = sorted(all_posts, key=lambda x: x['num_comments'], reverse=True)[:WEEKLY_TOP_POSTS]
+    print(f"📖 抓取前 {len(hot)} 帖的高赞评论...\n")
+    pwc = []
+    for p in hot:
+        print(f"  💬 [{p['num_comments']}评] r/{p['subreddit']} — {p['title'][:60]}", flush=True)
+        p['comments'] = fetch_comments(p['id'], p['subreddit'], cookie_str)
+        pwc.append(p)
+        time.sleep(0.7)
+
+    report = analyze_weekly(pwc, args.model)
+    today_str = datetime.date.today().isoformat()
+    path = save_report(report, f"weekly_{today_str}", args.output)
+    print(f"✅ 报告已保存：{path}")
+
+    scan = {"posts_scanned": len(pwc),
+            "comments_analyzed": sum(len(p.get('comments', [])) for p in pwc),
+            "subreddits": [s[0] for s in WEEKLY_SUBREDDITS]}
+    maybe_push_to_lark(report, args, "weekly", f"周报-{today_str}", "weekly", scan)
 
 
 def main():
     args = parse_args()
     cookie_str = get_cookies()
 
-    if args.product:
-        run_targeted_mode(args.product, cookie_str, args.model, args.output)
+    if args.weekly:
+        run_weekly_mode(cookie_str, args)
+    elif args.product:
+        run_targeted_mode(cookie_str, args)
     else:
-        print("🌐 宽泛模式：自动发现产品机会", flush=True)
-        run_broad_mode(cookie_str, args.model, args.output)
+        run_broad_mode(cookie_str, args)
 
 
 if __name__ == '__main__':

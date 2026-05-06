@@ -1,151 +1,158 @@
 ---
 name: reddit-scout
-description: Reddit 选品侦察工具。从真实 Reddit 用户讨论中挖掘跨境电商产品机会，生成深度分析报告（多个具体痛点 + 用户原话引用 + 产品规格建议 + 机会评分）。无需 Reddit API Key，通过 Chrome cookies 访问。可选将报告推送至飞书文档并发私信给用户。当用户要求"跑选品分析"、"找产品机会"、"Reddit 选品"、"选品报告"时触发。
+description: Reddit 选品侦察工具。从真实 Reddit 用户讨论中挖掘跨境电商产品机会，生成深度分析报告（多个具体痛点 + 用户原话引用 + 产品规格建议 + 数据支撑的机会评分）。无需 Reddit API Key，通过 Chrome cookies 访问。三种模式：宽泛/定向/周报；可一键自动推送结果到飞书文档 + 多维表格。当用户要求"跑选品分析"、"找产品机会"、"Reddit 选品"、"选品报告"、"周报"时触发。
 ---
 
 # Reddit 选品侦察（reddit-scout）
 
-从多个 Reddit 版块抓取热帖评论，由 Claude 深度分析出一个最有价值的产品机会，输出约 1000+ 字的结构化报告，可选推送飞书。
+从多个 Reddit 版块抓取热帖评论，由 Claude 深度分析产品机会，输出 1000+ 字的结构化报告，可一键推送到飞书。
 
 ## 依赖
-
-运行前确认已安装：
 
 ```bash
 pip install browser_cookie3 anthropic
 ```
 
-- `browser_cookie3`：自动读取本机 Chrome 的 Reddit 登录态，无需 API Key、无需配置——前提是 Chrome 里已登录 Reddit。首次运行时 macOS 会弹系统授权窗口（"python3 想要访问 Chrome Safe Storage"），点"始终允许"即可，之后不再弹
-- `anthropic`：Claude API（需设置环境变量 `ANTHROPIC_API_KEY`）
+- `browser_cookie3`：自动读取本机 Chrome 的 Reddit 登录态。首次运行 macOS 弹 Keychain 授权窗口，点"始终允许"。
+- `anthropic`：Claude API（需 `ANTHROPIC_API_KEY`）
+- `lark-cli`（仅 `--bitable` 时需要）：用于创建飞书文档 + 写入多维表
 
-## 核心脚本
+## 三种模式
 
-`scripts/scout.py` — 一键完成抓取 + 分析 + 保存报告。
+### 1. 宽泛模式（默认）
 
-```bash
-# 默认（claude-sonnet-4-6，质量/成本均衡）
-python3 /path/to/reddit-scout/scripts/scout.py
-
-# 指定更强的模型（分析更深，成本更高）
-python3 scripts/scout.py --model claude-opus-4-7
-
-# 指定更快/更便宜的模型（快速验证）
-python3 scripts/scout.py --model claude-haiku-4-5-20251001
-```
-
-可用模型：
-
-| 模型 | 特点 | 适合场景 |
-|------|------|---------|
-| `claude-opus-4-7` | 最强分析深度 | 正式报告、要求高 |
-| `claude-sonnet-4-6` | 质量/成本均衡（默认） | 日常使用 |
-| `claude-haiku-4-5-20251001` | 最快/最便宜 | 快速测试、验证数据 |
-
-输出路径：`/tmp/reddit_deep_YYYYMMDD_HHMM.md`
-
-### 可调参数（脚本顶部 SUBREDDITS 变量）
-
-```python
-SUBREDDITS = [
-    ("BuyItForLife", "top", "week"),   # (版块名, 排序, 时间段)
-    ("Frugal", "top", "week"),
-    ("HomeImprovement", "hot", None),  # hot 不需要时间段
-]
-POSTS_PER_SUB = 15           # 每版块帖子数
-COMMENTS_PER_POST = 30       # 每帖最多评论数
-TOP_POSTS_FOR_ANALYSIS = 20  # 取评论数前N帖送分析
-```
-
-要更换版块，参考 `references/subreddits.md` 中按品类整理的推荐组合，直接修改 `SUBREDDITS` 变量后重新运行。
-
-## 工作流程
-
-### 基础流程：生成分析报告
-
-1. 运行脚本（约 2-3 分钟）
-2. 读取输出文件，呈现报告内容给用户
+适合不知道研究什么品类时，让 Claude 从 6 个版块的热帖中**自主选出 1 个最有价值的产品机会**。
 
 ```bash
 python3 scripts/scout.py
 ```
 
-报告保存至 `/tmp/reddit_deep_YYYYMMDD_HHMM.md`，运行结束时输出路径。
+### 2. 定向模式（`--product`）
 
-### 进阶流程：推送飞书文档 + 私信
-
-报告生成后，执行以下步骤（需 `lark-cli` 已配置）：
-
-**Step 1 — 创建飞书文档**
+适合已经有产品方向，让 Claude 规划搜索策略并深度分析该品类。**输出 1 个产品的深度报告**。
 
 ```bash
-lark-cli docs +create \
-  --title "Reddit 选品机会：[产品名] (YYYY-MM-DD)" \
-  --markdown "$(cat /tmp/reddit_deep_YYYYMMDD_HHMM.md)"
+python3 scripts/scout.py --product "女士钱包"
+python3 scripts/scout.py -p "women's wallet" --model claude-opus-4-7
 ```
 
-记录返回的 `doc_url`。
+工作流程：
+1. Claude 规划搜索策略（subreddits + 关键词 + 过滤词）
+2. 每个 subreddit 内搜索前 2 个关键词，剩余关键词全站搜索
+3. 按核心词过滤无关帖，优先目标版块、按评论数排序
+4. 抓取 25 帖评论 → Claude 深度分析
 
-**Step 2 — 发送产品图片**（可选）
+### 3. 周报模式（`--weekly`）
 
-图片必须先下载到本地，使用相对路径发送：
+横扫 10 个品类版块，让 Claude 识别 **5 个不同方向**的产品机会，适合定期扫描热点。
 
 ```bash
-cd ~
-lark-cli im +messages-send \
-  --user-id <用户open_id> \
-  --image ./product_image.jpg \
-  --as bot
+python3 scripts/scout.py --weekly
+python3 scripts/scout.py -w --bitable     # 推荐：周一早上跑一遍 + 自动入库
 ```
 
-**Step 3 — 发送摘要 + 文档链接**
+覆盖品类：BuyItForLife / HomeImprovement / Frugal / Cooking / Parenting / dogs / camping / femalefashionadvice / malelivingspace / declutter
+
+## 飞书自动推送（`--bitable`）
 
 ```bash
-lark-cli im +messages-send \
-  --user-id <用户open_id> \
-  --as bot \
-  --markdown $'## [产品名]：Reddit 选品机会\n\n**机会评分：** X/10\n\n**核心痛点：**\n- 痛点一\n- 痛点二\n\n**机会点：**\n- 方向一\n- 方向二\n\n完整报告：<doc_url>'
+python3 scripts/scout.py --weekly --bitable
+python3 scripts/scout.py -p "攀岩鞋" --bitable
 ```
 
-飞书 markdown 不支持 `---` 分隔线（渲染为 `<br>`），消息中不要使用，用空行替代。
+加上 `--bitable` 后，分析完成会自动跑完三步：
+1. **创建飞书文档**：把整篇报告创建成飞书 docx，记录 doc_url
+2. **写入选品记录表**：每个机会一行（含评分细分、痛点摘要、机会点、竞品现状、跟进状态、文档链接）
+3. **写入 Reddit 热帖表**：每个机会的证据帖一行，关联到对应选品记录
 
-## 报告结构（Claude 输出格式）
+实现机制：分析 prompt 末尾要求 Claude 输出一个 `<!--BITABLE_DATA{...}-->` JSON 块（HTML 注释包裹，markdown 渲染时不显示），脚本解析后调用 `lark-cli` 完成入库。
 
-脚本让 Claude 输出以下结构（约 1000+ 字，单次单品深度分析）：
+### 配置多维表 token
+
+默认指向脚本顶部 `DEFAULT_BITABLE` 中预设的 base/table。如要自己建库，复制 `~/.reddit-scout.json`：
+
+```json
+{
+  "base_token": "你的_base_token",
+  "table_research": "选品记录表_table_id",
+  "table_posts": "Reddit热帖表_table_id"
+}
+```
+
+### 多维表 Schema
+
+**选品记录** 表字段：
+- 产品名称（text） / 分析日期（datetime） / 分析模式（select：定向/宽泛/周报）/ 输入方向（text）
+- 机会评分（number）/ 需求真实性（number）/ 市场空间（number）/ 差异化可行性（number）
+- 核心痛点（text）/ 机会点（text）/ 竞品现状（text）
+- 覆盖版块（text）/ 扫描帖数（number）/ 精选帖数（number）
+- 跟进状态（select：待评估/研究中/已立项/已放弃）
+- 飞书文档（url）/ 备注（text）/ 亚马逊验证（text，可选）
+
+**Reddit 热帖** 表字段：
+- 关联研究（link → 选品记录）
+- 帖子标题 / 版块 / 赞数 / 评论数 / 高赞评论 / 帖子摘要 / 发现日期
+
+## 模型选择
+
+```bash
+python3 scripts/scout.py --weekly --model claude-opus-4-7      # 最强
+python3 scripts/scout.py --weekly --model claude-haiku-4-5-20251001  # 最快/最便宜
+```
+
+| 模型 | 适合场景 |
+|------|---------|
+| `claude-opus-4-7` | 正式深度报告 |
+| `claude-sonnet-4-6` | 默认，质量/成本均衡 |
+| `claude-haiku-4-5-20251001` | 快速验证 |
+
+## 输出路径
+
+```
+~/reddit-scout-reports/reddit_<标签>_YYYYMMDD_HHMM.md
+```
+
+可用 `--output` 覆盖。
+
+## 报告结构
 
 ```
 ## [产品名]：Reddit 买家痛点深度研究
+**品类背景**
 
-**品类背景**（2-3句：市场规模、核心用户群）
+### 痛点一/二/三/四：[标题]
+（本质 + Reddit 证据 + 用户原话 + 市场分析）
 
-### 痛点一：[具体标题]
-本质 + Reddit 证据（r/XX，「帖子标题」X赞/X评）
-用户原话（英文原文引用）
-市场分析
+## 机会点 ①②③（具体规格/材质/做法/定价）
 
-### 痛点二/三/四：...（同上结构）
-
-## 机会点
-① 具体方向（材质/尺寸/制造可行性/卖点文案方向）
-② ...
-③ ...
-
-## 竞品现状（现有竞品、定价区间、市场缺口）
+## 竞品现状
 
 ## 机会评分：X/10
-需求真实性X分 / 市场空间X分 / 差异化可行性X分
-综合判断（含风险）
+| 维度 | 得分 | 数据依据 |
+（需求真实性/市场空间/差异化可行性，每项必须列举本次数据中的帖子数、评论数、赞数）
+诚实声明：样本规模限制
 
-## 目标买家画像（人群/购买动机/价格敏感度/触达渠道）
+## 目标买家画像
 
-## 本次研究数据（覆盖版块/扫描帖数/精选讨论数）
+## 本次研究数据
+
+<!--BITABLE_DATA
+{...}        // 程序解析用的 JSON 块（渲染时不显示）
+-->
 ```
+
+周报模式输出 5 个机会 + 3 个次级信号，每个机会简化版结构。
+
+## 关于机会评分
+
+评分**严格基于本次抓取的真实数据**。Claude 必须在评分表格中列出具体数字（帖子数 / 评论数 / 赞数），并附"诚实声明"——Reddit 讨论量不等于市场规模，分数只反映 Reddit 上的声音。
 
 ## 常见问题
 
-**Keychain 弹窗**：首次运行 macOS 弹窗要求访问 Chrome 密钥串，选"始终允许"。之后无需重复操作。
+**首次运行 macOS Keychain 弹窗**：选"始终允许"，之后不再弹。
 
-**Reddit 某帖评论请求超时**：已内置超时处理，自动跳过，不影响整体分析。
+**Reddit 评论请求超时**：内置 15s 超时处理，自动跳过。
 
-**报告中出现"请选A/B"等交互内容**：说明 Claude 判断当前数据中无明显产品机会，可换一批 subreddit 或增大 `TOP_POSTS_FOR_ANALYSIS`。
+**`--bitable` 推送失败**：确认 `lark-cli auth login --domain base --recommend` 已完成；检查 `~/.reddit-scout.json` 中 base_token / table_id 正确。
 
-**飞书发图片路径报错**：图片必须用相对路径。先 `cd ~`，再 `--image ./filename.jpg`，不能用绝对路径如 `/tmp/xxx.jpg`。
+**报告里没有 BITABLE_DATA 块**：模型偶尔会忘记输出 JSON 块，重试一次或换 opus 模型。

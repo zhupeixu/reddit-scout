@@ -1,6 +1,6 @@
 ---
 name: reddit-scout
-description: Reddit 选品侦察工具。从真实 Reddit 用户讨论中挖掘跨境电商产品机会，生成深度分析报告（仿 noinoi 风格：多个具体痛点 + 用户原话引用 + 产品规格建议 + 机会评分）。无需 Reddit API Key，通过 Chrome cookies 访问。可选将报告推送至飞书文档并发私信给用户。当用户要求"跑选品分析"、"找产品机会"、"Reddit 选品"、"选品报告"时触发。
+description: Reddit 选品侦察工具。从真实 Reddit 用户讨论中挖掘跨境电商产品机会，生成深度分析报告（多个具体痛点 + 用户原话引用 + 产品规格建议 + 机会评分）。无需 Reddit API Key，通过 Chrome cookies 访问。可选将报告推送至飞书文档并发私信给用户。当用户要求"跑选品分析"、"找产品机会"、"Reddit 选品"、"选品报告"时触发。
 ---
 
 # Reddit 选品侦察（reddit-scout）

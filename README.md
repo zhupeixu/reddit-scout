@@ -2,8 +2,6 @@
 
 一个 Claude Code skill，从 Reddit 真实用户讨论中自动挖掘跨境电商选品机会，生成深度分析报告。
 
-灵感来自 [@noinoi](https://www.xiaohongshu.com) 在小红书上的 Reddit 买家痛点研究系列。
-
 ## 效果示例
 
 > **家居文档整理系统：Reddit 买家痛点深度研究**

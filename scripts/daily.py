@@ -23,7 +23,8 @@ from scout import (
 )
 
 # ── 用户配置 ──────────────────────────────────────────────
-DAILY_RECIPIENT_OPEN_ID = "ou_0b4db9fa3f4862c82eb397a11a19640f"
+DAILY_RECIPIENT_OPEN_ID = "ou_0df2b09f3185bb15e3c1ea089a80e75e"  # scout-bot 命名空间下的 open_id
+LARK_PROFILE = "scout-bot"  # lark-cli profile 名（出海选品客服机器人）
 BITABLE_DOMAIN = "ycnm1prsz3tg.feishu.cn"
 DAYS_LOOKBACK = 60
 MODEL = DEFAULT_MODEL
@@ -164,7 +165,8 @@ def send_card(open_id, card_json):
         "--user-id", open_id,
         "--msg-type", "interactive",
         "--content", json.dumps(card_json, ensure_ascii=False),
-        "--as", "bot"
+        "--as", "bot",
+        "--profile", LARK_PROFILE,
     ], capture_output=True, text=True)
     if r.returncode != 0 or not r.stdout.strip().startswith("{"):
         print(f"❌ 私信发送失败: {r.stdout[:300]} {r.stderr[:300]}")

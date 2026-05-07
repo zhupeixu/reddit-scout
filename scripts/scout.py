@@ -247,12 +247,55 @@ SCORING_INSTRUCTIONS = """
 
 | 维度 | 得分 | 数据依据 |
 |------|------|---------|
-| 需求真实性 | X/3 | 本次数据中明确表达该痛点的帖子数、评论数、总赞数（如：3篇帖子 + 47条评论提及，累计 312赞） |
-| 市场空间 | X/3 | 搜索结果密度、版块规模（如：r/BuyItForLife 月活300万+，该话题帖子 top 帖平均 150赞） |
+| 需求真实性 | X/3 | 本次数据中明确表达该痛点的帖子数、评论数、总赞数（如:3篇帖子 + 47条评论提及，累计 312赞） |
+| 市场空间 | X/3 | 搜索结果密度、版块规模（如:r/BuyItForLife 月活300万+，该话题帖子 top 帖平均 150赞） |
 | 差异化可行性 | X/4 | 现有竞品的具体缺陷（引用评论）vs 你的改进方案是否可落地 |
 
 **诚实声明**：本次样本为 {post_count} 帖 / {comment_count} 条评论，Reddit 讨论量不等于市场规模，以上评分仅反映 Reddit 上的声音，不构成市场验证。
 """
+
+
+def stream_with_retry(model, max_tokens, prompt, max_retries=3):
+    """
+    流式调用 Claude；网络瞬断时自动重试，最后一次重试改用非流式（更稳定）。
+    """
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            full_text = ""
+            # 最后一次重试：用非流式调用避免 chunk 断流
+            if attempt == max_retries - 1:
+                print(f"\n  [重试 {attempt+1}/{max_retries}] 改用非流式...", flush=True)
+                resp = client.messages.create(
+                    model=model, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                full_text = resp.content[0].text
+                print(full_text)
+                return full_text
+
+            with client.messages.stream(
+                model=model, max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}]
+            ) as stream:
+                for text in stream.text_stream:
+                    print(text, end="", flush=True)
+                    full_text += text
+            print()
+            return full_text
+        except (anthropic.APIConnectionError, anthropic.APIError, Exception) as e:
+            err_name = type(e).__name__
+            # 只重试网络/流相关的错误，业务错误立即失败
+            if not any(s in err_name for s in ('RemoteProtocol', 'APIConnection', 'Timeout', 'APIError')):
+                # 检查 message 看是否流式相关
+                msg = str(e).lower()
+                if 'peer closed' not in msg and 'incomplete' not in msg and 'connection' not in msg:
+                    raise
+            last_err = e
+            wait = 2 ** attempt
+            print(f"\n⚠️  Claude 流式调用失败（{err_name}: {str(e)[:100]}），{wait}s 后重试...", flush=True)
+            time.sleep(wait)
+    raise last_err if last_err else RuntimeError("stream_with_retry exhausted")
 
 
 def bitable_json_instruction(num_opportunities):
@@ -360,16 +403,7 @@ def analyze_broad(posts_with_comments, model):
 """
 
     print(f"\n🤖 正在进行深度分析（模型：{model}）...\n")
-    full_text = ""
-    with client.messages.stream(
-        model=model, max_tokens=8000,
-        messages=[{"role": "user", "content": prompt}]
-    ) as stream:
-        for text in stream.text_stream:
-            print(text, end="", flush=True)
-            full_text += text
-    print("\n")
-    return full_text
+    return stream_with_retry(model, 8000, prompt)
 
 
 def analyze_targeted(posts_with_comments, product, model):
@@ -423,16 +457,7 @@ def analyze_targeted(posts_with_comments, product, model):
 """
 
     print(f"\n🤖 深度分析中（模型：{model}）...\n")
-    full_text = ""
-    with client.messages.stream(
-        model=model, max_tokens=8000,
-        messages=[{"role": "user", "content": prompt}]
-    ) as stream:
-        for text in stream.text_stream:
-            print(text, end="", flush=True)
-            full_text += text
-    print("\n")
-    return full_text
+    return stream_with_retry(model, 8000, prompt)
 
 
 def analyze_weekly(posts_with_comments, model):
@@ -492,16 +517,7 @@ def analyze_weekly(posts_with_comments, model):
 """
 
     print(f"\n🤖 生成周报中（模型：{model}）...\n")
-    full_text = ""
-    with client.messages.stream(
-        model=model, max_tokens=10000,
-        messages=[{"role": "user", "content": prompt}]
-    ) as stream:
-        for text in stream.text_stream:
-            print(text, end="", flush=True)
-            full_text += text
-    print("\n")
-    return full_text
+    return stream_with_retry(model, 10000, prompt)
 
 
 # ── 飞书多维表格自动推送 ────────────────────────────────────────
@@ -554,9 +570,16 @@ def push_record(base_token, table_id, payload, record_id=None):
     try:
         d = json.loads(r.stdout)
         if not d.get("ok"):
+            print(f"     lark-cli 返回错误: {d.get('error', d)}")
             return None
-        return d["data"]["record"].get("record_id") or record_id
-    except (json.JSONDecodeError, KeyError):
+        rec = d["data"].get("record", {})
+        # +record-upsert 响应中 record_id 在 record_id_list[0]
+        rid_list = rec.get("record_id_list") or []
+        if rid_list:
+            return rid_list[0]
+        return rec.get("record_id") or record_id
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"     解析响应失败: {e}; stdout 前 200 字: {r.stdout[:200]}")
         return None
 
 

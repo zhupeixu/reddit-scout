@@ -582,7 +582,7 @@ def format_amazon_section_for_prompt(amazon_data):
 def filter_posts_by_relevance(posts, product, model="claude-haiku-4-5-20251001"):
     """
     用 Haiku 给每帖打相关度分，去掉与产品无关的噪音。
-    返回 (相关帖列表, 评分明细) — 用 ≥ 6 分作为阈值。
+    返回 (相关帖列表, 评分明细) — 用 ≥ 7 分作为阈值（更严，避免松鼠视频这种边缘命中混入）。
     """
     if not posts:
         return [], []
@@ -591,16 +591,26 @@ def filter_posts_by_relevance(posts, product, model="claude-haiku-4-5-20251001")
         + (f" || {p['selftext'][:80]}" if p['selftext'] else "")
         for i, p in enumerate(posts)
     )
-    prompt = f"""判断以下 Reddit 帖子标题是否**真正讨论「{product}」这个产品/品类**（不是字面巧合）。
+    prompt = f"""判断以下 Reddit 帖子是否**真正讨论「{product}」这个产品/品类的真实买家选购或使用经验**。
+
+**关键判断标准**（这是给跨境电商选品分析用的，要的是消费者购买决策的信号）：
+- 10/10：买家咨询推荐、抱怨产品缺陷、对比品牌型号、分享使用心得
+- 7-9：评论里有真实购买/使用讨论，即使主帖是分享照片
+- 4-6：模糊涉及该品类但不是消费者讨论（如评测视频、户外活动顺带提及）
+- 0-3：**字面命中但完全不是该产品的消费讨论**——例如：
+  - 萌宠/动物视频里有产品作为道具（"松鼠坐在小桌子上"虽然提到 camping table，但不是买家讨论）
+  - 旅游/事件分享里只是顺带提到产品名
+  - 玩游戏/电影/小说虚构场景里出现该词
 
 对每帖**严格按格式**输出 1 行：`序号|相关度|理由`
-- 相关度：0-10 整数（0=完全无关，10=深度讨论该产品/品类的痛点或推荐）
-- 理由：1 短句（10 字以内）
+- 相关度：0-10 整数
+- 理由：1 短句（≤15 字）
 
-示例（如果产品是 portable camping fan）：
-1|9|露营风扇推荐
-2|0|NBA 球迷讨论 fan 一词
-3|7|户外装备购买建议含风扇
+示例（产品 = portable camping fan）：
+1|9|露营风扇购买推荐讨论
+2|0|NBA 球迷帖 fan 字面命中
+3|2|宠物视频道具非消费讨论
+4|7|户外帖评论区有人推荐风扇
 
 只输出 N 行，不要任何其他内容。
 
@@ -628,7 +638,7 @@ def filter_posts_by_relevance(posts, product, model="claude-haiku-4-5-20251001")
         for i, p in enumerate(posts):
             sc, why = scores.get(i, (5, "未评分"))
             details.append((i, p['title'][:50], sc, why))
-            if sc >= 6:
+            if sc >= 7:  # 提高阈值 6→7，更严格
                 kept.append(p)
         return kept, details
     except Exception as e:

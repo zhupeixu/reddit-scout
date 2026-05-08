@@ -312,11 +312,26 @@ def run_targeted_inline(direction, model):
     print(f"📖 抓 {len(hot)} 帖评论...")
 
     # Reddit 是主信号源，Amazon 只能辅证。
-    # Reddit 帖 < 3 说明信号不足以产出可信报告——直接抛错，绝不用 Amazon 顶替。
+    # 数量 < 3 → 抛错；数量足但质量太低（来自动物萌宠/旅游分享之类的字面命中）也抛错
     if len(hot) < 3:
         raise RuntimeError(
             f"Reddit 相关帖不足 3 篇（实际 {len(hot)} 篇）。"
-            f"Reddit 是主信号源，Amazon 数据仅辅证，样本不足终止以防伪造报告。"
+            f"Reddit 是主信号源，样本不足终止以防伪造报告。"
+        )
+
+    # 质量保护：检查留下来的帖子是否真的来自相关版块
+    # 如果 50%+ 帖子来自动物/萌宠/通用大水版（字面命中混入的），也算质量不足
+    LOW_SIGNAL_PATTERNS = ['aww', 'funnyanimal', 'cats', 'dogs', 'beamazed',
+                            'nextfucking', 'mademesmile', 'pics', 'videos',
+                            'gif', 'funny', 'oddlysatisfying', 'interestingasfuck']
+    low_signal_count = sum(
+        1 for p in hot
+        if any(pat in p['subreddit'].lower() for pat in LOW_SIGNAL_PATTERNS)
+    )
+    if low_signal_count >= len(hot) / 2:
+        raise RuntimeError(
+            f"通过过滤的 {len(hot)} 帖中 {low_signal_count} 篇来自萌宠/娱乐水版"
+            f"（字面命中而非真实买家讨论），质量不足以做选品分析，终止。"
         )
 
     pwc = []

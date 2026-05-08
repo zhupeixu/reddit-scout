@@ -580,14 +580,23 @@ def extract_bitable_data(report_text):
 
 
 def create_feishu_doc(title, markdown_content):
-    """通过 lark-cli 创建飞书文档，返回 doc_url"""
+    """通过 lark-cli 创建飞书文档，返回 doc_url。
+    自动剥掉文末的 <!--BITABLE_DATA--> JSON 块（飞书 docx 渲染不会隐藏 HTML 注释）。
+    """
     print(f"📄 创建飞书文档：{title}", flush=True)
+    # 剥掉 BITABLE_DATA 块（含包裹的换行/分隔线）
+    cleaned = re.sub(
+        r'\n*-{3,}\n*<!--BITABLE_DATA.*?-->\n*',
+        '\n',
+        markdown_content,
+        flags=re.DOTALL
+    )
+    cleaned = re.sub(r'\n*<!--BITABLE_DATA.*?-->\n*', '\n', cleaned, flags=re.DOTALL).rstrip() + "\n"
     r = subprocess.run(
-        ["lark-cli", "docs", "+create", "--title", title, "--markdown", markdown_content],
+        ["lark-cli", "docs", "+create", "--title", title, "--markdown", cleaned],
         capture_output=True, text=True
     )
     raw = r.stdout
-    # docs +create 可能输出 [deprecated] 警告行，从首个 { 开始截取
     start = raw.find('{')
     if start < 0:
         print(f"❌ 飞书文档创建失败：{raw[:300]}")

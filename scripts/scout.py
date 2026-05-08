@@ -154,17 +154,18 @@ def fetch_posts_from_sub(sub, sort, timeframe, cookie_str, limit=None):
             'num_comments': d['num_comments'],
             'selftext': d['selftext'][:600] if d.get('selftext') else '',
             'subreddit': sub,
+            'created_utc': d.get('created_utc'),
         })
     return posts
 
 
-def search_reddit(keyword, subreddit=None, cookie_str="", limit=TARGETED_POSTS_PER_SEARCH):
-    """关键词搜索帖子，可限定 subreddit"""
+def search_reddit(keyword, subreddit=None, cookie_str="", limit=TARGETED_POSTS_PER_SEARCH, timeframe="year"):
+    """关键词搜索帖子，可限定 subreddit + 时间窗口（hour/day/week/month/year/all）"""
     q = urllib.parse.quote(keyword)
     if subreddit:
-        url = f"https://www.reddit.com/r/{subreddit}/search.json?q={q}&sort=top&t=year&limit={limit}&restrict_sr=1"
+        url = f"https://www.reddit.com/r/{subreddit}/search.json?q={q}&sort=top&t={timeframe}&limit={limit}&restrict_sr=1"
     else:
-        url = f"https://www.reddit.com/search.json?q={q}&sort=top&t=year&limit={limit}"
+        url = f"https://www.reddit.com/search.json?q={q}&sort=top&t={timeframe}&limit={limit}"
     data = reddit_get(url, cookie_str)
     if not data:
         return []
@@ -178,6 +179,7 @@ def search_reddit(keyword, subreddit=None, cookie_str="", limit=TARGETED_POSTS_P
             'num_comments': d['num_comments'],
             'selftext': d['selftext'][:600] if d.get('selftext') else '',
             'subreddit': d['subreddit'],
+            'created_utc': d.get('created_utc'),
         })
     return posts
 
@@ -201,24 +203,95 @@ def discover_relevant_subreddits(product, cookie_str, top_n=10):
     数据驱动的子版块发现：
     - 用产品词在 Reddit 全站搜索 top-year 帖子
     - 统计这些热帖来自哪些版块
+    - 过滤掉常见噪音版块（NFL/NBA/球迷/股票/政治等高曝光大水版）
     - 返回出现频次最高的 top_n 个版块（带证据：N 帖、累计赞数）
     """
+    # 已知的高曝光大水版黑名单：搜任何短词都可能误伤这些
+    NOISE_SUBREDDITS = {
+        'nba', 'nfl', 'soccer', 'baseball', 'hockey', 'mma', 'formula1',
+        'politics', 'worldnews', 'news', 'AskReddit', 'funny', 'pics',
+        'memes', 'wallstreetbets', 'Superstonk', 'CryptoCurrency',
+        'SubredditDrama', 'BestofRedditorUpdates', 'tifu', 'AmItheAsshole',
+        'relationship_advice', 'todayilearned', 'mildlyinteresting',
+        'unpopularopinion', 'TwoXChromosomes', 'gaming', 'pcmasterrace',
+        'movies', 'television', 'music', 'KpopFap', 'kpop', 'popheads',
+        'taylorswift', 'beatles', 'leagueoflegends', 'DotA2',
+    }
+    NOISE_LOWER = {s.lower() for s in NOISE_SUBREDDITS}
+
     q = urllib.parse.quote(product)
     url = f"https://www.reddit.com/search.json?q={q}&sort=top&t=year&limit=100"
     data = reddit_get(url, cookie_str)
     if not data or 'data' not in data:
         return []
-    counts = {}  # subreddit -> {posts, total_score}
+    counts = {}
     for item in data['data']['children']:
         d = item['data']
         sub = d.get('subreddit')
-        if not sub:
+        if not sub or sub.lower() in NOISE_LOWER:
             continue
         c = counts.setdefault(sub, {"posts": 0, "score": 0})
         c["posts"] += 1
         c["score"] += d.get('score', 0)
     ranked = sorted(counts.items(), key=lambda kv: (kv[1]["posts"], kv[1]["score"]), reverse=True)
     return [{"subreddit": s, "posts": v["posts"], "total_score": v["score"]} for s, v in ranked[:top_n]]
+
+
+def filter_posts_by_relevance(posts, product, model="claude-haiku-4-5-20251001"):
+    """
+    用 Haiku 给每帖打相关度分，去掉与产品无关的噪音。
+    返回 (相关帖列表, 评分明细) — 用 ≥ 6 分作为阈值。
+    """
+    if not posts:
+        return [], []
+    items = "\n".join(
+        f"{i+1}. r/{p['subreddit']} | {p['title'][:120]}"
+        + (f" || {p['selftext'][:80]}" if p['selftext'] else "")
+        for i, p in enumerate(posts)
+    )
+    prompt = f"""判断以下 Reddit 帖子标题是否**真正讨论「{product}」这个产品/品类**（不是字面巧合）。
+
+对每帖**严格按格式**输出 1 行：`序号|相关度|理由`
+- 相关度：0-10 整数（0=完全无关，10=深度讨论该产品/品类的痛点或推荐）
+- 理由：1 短句（10 字以内）
+
+示例（如果产品是 portable camping fan）：
+1|9|露营风扇推荐
+2|0|NBA 球迷讨论 fan 一词
+3|7|户外装备购买建议含风扇
+
+只输出 N 行，不要任何其他内容。
+
+待判断帖子：
+{items}"""
+    try:
+        resp = client.messages.create(
+            model=model, max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        lines = resp.content[0].text.strip().split("\n")
+        scores = {}
+        for ln in lines:
+            parts = ln.strip().split("|", 2)
+            if len(parts) >= 2:
+                try:
+                    idx = int(parts[0].strip()) - 1
+                    score = int(parts[1].strip())
+                    reason = parts[2].strip() if len(parts) > 2 else ""
+                    scores[idx] = (score, reason)
+                except ValueError:
+                    continue
+        kept = []
+        details = []
+        for i, p in enumerate(posts):
+            sc, why = scores.get(i, (5, "未评分"))
+            details.append((i, p['title'][:50], sc, why))
+            if sc >= 6:
+                kept.append(p)
+        return kept, details
+    except Exception as e:
+        print(f"⚠️  相关度过滤失败（{e}），使用原始全部帖子")
+        return posts, []
 
 
 def plan_search(product, model, candidate_subs=None):
@@ -274,7 +347,14 @@ def plan_search(product, model, candidate_subs=None):
 def build_post_texts(posts_with_comments):
     texts = []
     for p in posts_with_comments:
-        text = f"【r/{p['subreddit']}】{p['score']}赞 / {p['num_comments']}评\n标题: {p['title']}\n"
+        # 把发帖日期展示给 Claude
+        date_str = ""
+        if p.get('created_utc'):
+            try:
+                date_str = " · " + datetime.datetime.utcfromtimestamp(p['created_utc']).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        text = f"【r/{p['subreddit']}】{p['score']}赞 / {p['num_comments']}评{date_str}\n标题: {p['title']}\n"
         if p['selftext']:
             text += f"内容: {p['selftext']}\n"
         if p['comments']:
@@ -283,6 +363,30 @@ def build_post_texts(posts_with_comments):
                 text += f"  ({c['score']}赞) \"{c['body'][:250]}\"\n"
         texts.append(text)
     return "\n\n---\n\n".join(texts)
+
+
+def post_date_distribution(posts):
+    """计算帖子的时间分布，给 Claude 引用用"""
+    if not posts:
+        return ""
+    today = datetime.datetime.utcnow()
+    buckets = {"近 30 天": 0, "30-90 天": 0, "90-180 天": 0, "180 天以上": 0, "未知日期": 0}
+    for p in posts:
+        ts = p.get('created_utc')
+        if not ts:
+            buckets["未知日期"] += 1
+            continue
+        days = (today - datetime.datetime.utcfromtimestamp(ts)).days
+        if days <= 30:
+            buckets["近 30 天"] += 1
+        elif days <= 90:
+            buckets["30-90 天"] += 1
+        elif days <= 180:
+            buckets["90-180 天"] += 1
+        else:
+            buckets["180 天以上"] += 1
+    parts = [f"{k}: {v}" for k, v in buckets.items() if v > 0]
+    return " | ".join(parts)
 
 
 SCORING_INSTRUCTIONS = """
@@ -460,6 +564,7 @@ def analyze_targeted(posts_with_comments, product, model):
     combined = build_post_texts(posts_with_comments)
     total_comments = sum(len(p.get('comments', [])) for p in posts_with_comments)
     today = datetime.date.today().isoformat()
+    date_dist = post_date_distribution(posts_with_comments)
 
     scoring_block = SCORING_INSTRUCTIONS.format(
         post_count=len(posts_with_comments),
@@ -469,6 +574,9 @@ def analyze_targeted(posts_with_comments, product, model):
     prompt = f"""你是一名资深跨境电商选品分析师，正在研究「{product}」这个品类的 Reddit 买家真实讨论。今天是 {today}。
 
 以下是从 Reddit 相关版块收集的帖子和评论数据（共 {len(posts_with_comments)} 个帖子，约 {total_comments} 条评论），数据采集时间为今天（{today}）。
+
+**帖子时间分布**：{date_dist}
+（每个帖子在原始数据里都标注了发帖日期，请在分析中诚实指出"信号是近期的还是历史性的"——如果某痛点引用的帖子大多在 180 天前，要在评分中体现"信号陈旧风险"）
 
 请对「{product}」进行深度买家痛点研究，严格按以下格式输出完整报告：
 

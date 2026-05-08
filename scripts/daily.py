@@ -19,6 +19,7 @@ from scout import (
     load_bitable_config, get_cookies, plan_search, search_reddit,
     fetch_comments, save_report, create_feishu_doc, push_to_bitable,
     extract_bitable_data, analyze_targeted, discover_relevant_subreddits,
+    filter_posts_by_relevance,
     MAX_POSTS_FOR_ANALYSIS, DEFAULT_MODEL,
 )
 
@@ -199,26 +200,48 @@ def run_targeted_inline(direction, model):
     print(f"📋 Subreddits: {', '.join(subreddits)}")
     print(f"🔍 关键词: {', '.join(keywords)}")
 
-    all_posts, seen = [], set()
-    for sub in subreddits:
-        for kw in keywords[:2]:
-            posts = search_reddit(kw, subreddit=sub, cookie_str=cookie_str)
-            new = [p for p in posts if p['id'] not in seen]
-            for p in new: seen.add(p['id'])
-            all_posts.extend(new)
+    def search_with_timeframe(tf):
+        """按指定时间窗口跑一遍搜索 + 过滤，返回相关帖列表"""
+        local_posts, local_seen = [], set()
+        for sub in subreddits:
+            for kw in keywords[:2]:
+                posts = search_reddit(kw, subreddit=sub, cookie_str=cookie_str, timeframe=tf)
+                for p in posts:
+                    if p['id'] not in local_seen:
+                        local_seen.add(p['id']); local_posts.append(p)
+                time.sleep(1.0)
+        for kw in keywords[2:]:
+            posts = search_reddit(kw, cookie_str=cookie_str, timeframe=tf)
+            for p in posts:
+                if p['id'] not in local_seen:
+                    local_seen.add(p['id']); local_posts.append(p)
             time.sleep(1.0)
-    for kw in keywords[2:]:
-        posts = search_reddit(kw, cookie_str=cookie_str)
-        new = [p for p in posts if p['id'] not in seen]
-        for p in new: seen.add(p['id'])
-        all_posts.extend(new)
-        time.sleep(1.0)
-
-    if filter_words:
-        relevant = [p for p in all_posts
+        if filter_words:
+            return [p for p in local_posts
                     if any(w.lower() in (p['title'] + ' ' + p['selftext']).lower() for w in filter_words)]
-    else:
-        relevant = all_posts
+        return local_posts
+
+    # 优先用近 30 天数据；不足则回退到近 1 年
+    print("⏳ 优先抓近 30 天热帖...", flush=True)
+    relevant = search_with_timeframe("month")
+    print(f"   近 30 天 keyword/filter 通过帖: {len(relevant)}")
+    if len(relevant) < 3:
+        print("⏳ 近 30 天数据不足，回退到近 1 年...", flush=True)
+        relevant = search_with_timeframe("year")
+        print(f"   近 1 年 keyword/filter 通过帖: {len(relevant)}")
+
+    # Haiku 相关度复核：去掉字面巧合的噪音帖
+    print("🧐 Haiku 复核相关度...", flush=True)
+    relevant, details = filter_posts_by_relevance(relevant, direction)
+    print(f"   相关度复核后剩余: {len(relevant)} 帖")
+    if details:
+        # 打印淘汰的最有代表性的几个，便于诊断
+        eliminated = [d for d in details if d[2] < 6][:5]
+        if eliminated:
+            print("   淘汰示例:")
+            for i, t, s, why in eliminated:
+                print(f"     · [{s}/10] {t}... ({why})")
+
     target_subs = set(s.lower() for s in subreddits)
     relevant.sort(key=lambda x: (0 if x['subreddit'].lower() in target_subs else 1, -x['num_comments']))
     hot = relevant[:MAX_POSTS_FOR_ANALYSIS]

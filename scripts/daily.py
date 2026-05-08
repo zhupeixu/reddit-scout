@@ -35,7 +35,7 @@ client = anthropic.Anthropic()
 
 
 def get_recent_products(days=DAYS_LOOKBACK):
-    """从多维表读取最近 N 天分析过的产品名 + 输入方向"""
+    """从多维表读取最近 N 天分析过的产品名 + 输入方向 + 品类"""
     cfg = load_bitable_config()
     r = subprocess.run([
         "lark-cli", "base", "+record-list",
@@ -46,16 +46,16 @@ def get_recent_products(days=DAYS_LOOKBACK):
     try:
         d = json.loads(r.stdout)
         if not d.get("ok"):
-            return [], []
+            return [], [], []
         data = d["data"]
         fields = data["fields"]
         if "产品名称" not in fields or "分析日期" not in fields:
-            return [], []
+            return [], [], []
         name_idx = fields.index("产品名称")
         date_idx = fields.index("分析日期")
         dir_idx = fields.index("输入方向") if "输入方向" in fields else None
         cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
-        names, dirs = [], []
+        names, dirs, recent_rows = [], [], []
         for row in data["data"]:
             try:
                 date_str = row[date_idx]
@@ -64,38 +64,57 @@ def get_recent_products(days=DAYS_LOOKBACK):
                     if dt >= cutoff:
                         n = row[name_idx]
                         if isinstance(n, list): n = n[0] if n else ""
-                        if n: names.append(n)
+                        if n:
+                            names.append(n)
+                            recent_rows.append((dt, n))
                         if dir_idx is not None:
                             dr = row[dir_idx]
                             if isinstance(dr, list): dr = dr[0] if dr else ""
                             if dr: dirs.append(dr)
             except (ValueError, TypeError, IndexError):
                 continue
-        return names, dirs
+        # 按日期降序，取最近 5 个产品名（用于品类轮换约束）
+        recent_rows.sort(key=lambda x: x[0], reverse=True)
+        last_5 = [n for _, n in recent_rows[:5]]
+        return names, dirs, last_5
     except Exception:
-        return [], []
+        return [], [], []
 
 
-def pick_fresh_direction(recent_names, recent_dirs, model=MODEL):
-    """让 Claude 选一个不重复的当下热门方向"""
+def pick_fresh_direction(recent_names, recent_dirs, last_5_names=None, model=MODEL):
+    """让 Claude 选一个不重复的当下热门方向，并强制品类轮换"""
     today = datetime.date.today().isoformat()
     seen = sorted(set(recent_names + recent_dirs))[:80]
     seen_block = "\n".join(f"- {p}" for p in seen) if seen else "（无历史）"
+    last_5_block = "\n".join(f"- {p}" for p in (last_5_names or [])) or "（无）"
     prompt = f"""你是一名跨境电商选品研究员。今天是 {today}。
 
-最近 {DAYS_LOOKBACK} 天已经分析过的产品方向（不要重复或近似）：
+最近 {DAYS_LOOKBACK} 天已分析过的产品（不要重复或近似）：
 {seen_block}
 
-请挑选一个**全新**的产品方向，要求：
-1. **当下时令热门**：考虑节令、季节、最近消费趋势（不要选夏天的防晒 / 冬天的暖手宝这种反季产品）
-2. 在 Reddit 英文社区有真实买家讨论的品类（家居/户外/宠物/育儿/健身/厨房/服饰/美妆/办公/工具等品类都可以）
-3. 跨境电商**可制造可发货**的实物 SKU（不要软件/服务/数字产品/食品）
-4. 用 1-3 个英文词描述（便于 Reddit 搜索）
+**最近 5 次分析的产品（按时间降序）**：
+{last_5_block}
+
+请挑选一个**全新**的产品方向，**严格遵守**：
+
+**1. 品类必须轮换（最重要）**
+从下面 12 个大品类里选：
+户外/露营 | 厨房/烹饪 | 家居/收纳 | 宠物 | 育儿/母婴 | 健身/运动恢复 | 个护/美妆 | 办公/学习 | 汽车配件 | 工具/DIY | 园艺/植物 | 服饰/配饰
+
+**规则**：如果"最近 5 次"里某品类出现 ≥ 2 次，本次**禁止**选该品类；优先选"最近 5 次"完全没出现过的品类。
+
+**2. 时令辅助**
+在轮换允许的品类里，再考虑节令/季节趋势。**轮换 > 时令**——宁可选轮换品类的相对冷门产品，也不要硬选当季但重复的品类。
+
+**3. 必须满足**
+- 在 Reddit 英文社区有真实买家讨论
+- 实物 SKU 可制造可发货（非软件/服务/数字/食品）
+- 用 1-3 个英文词描述（便于 Reddit 搜索）
 
 只返回 JSON：
-{{"direction": "英文产品方向（如 cat litter mat / women hiking pants / standing desk converter）", "category": "中文品类（如 宠物用品/服饰/办公）", "reason_cn": "为什么挑这个的中文 1 句话理由（结合时令或趋势）"}}"""
+{{"direction": "英文产品方向（如 cat litter mat / women hiking pants / standing desk converter）", "category": "中文大品类（必须是上面 12 类之一）", "reason_cn": "为什么挑这个的中文 1 句话理由，**必须明确说明本次避开了哪个最近高频出现的品类**"}}"""
     resp = client.messages.create(
-        model=model, max_tokens=300,
+        model=model, max_tokens=400,
         messages=[{"role": "user", "content": prompt}]
     )
     raw = resp.content[0].text.strip()
@@ -348,7 +367,7 @@ def main():
     print(f"🌅 启动每日选品分析（{datetime.datetime.now().isoformat()}）", flush=True)
 
     print("📚 读取已分析产品历史...", flush=True)
-    names, dirs = get_recent_products()
+    names, dirs, last_5 = get_recent_products()
     print(f"   过去 {DAYS_LOOKBACK} 天已分析：{len(names)} 个产品 / {len(set(dirs))} 次运行", flush=True)
 
     print("🧠 选择今日新方向...", flush=True)
@@ -357,7 +376,7 @@ def main():
     failed_directions = []
     for attempt in range(MAX_RETRIES):
         # 把已失败方向也加到避重列表，避免再选
-        pick = pick_fresh_direction(names + failed_directions, dirs + failed_directions)
+        pick = pick_fresh_direction(names + failed_directions, dirs + failed_directions, last_5_names=last_5)
         direction = pick["direction"]
         category = pick.get("category", "?")
         reason = pick.get("reason_cn", "")

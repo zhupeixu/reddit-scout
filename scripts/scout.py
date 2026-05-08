@@ -395,13 +395,16 @@ def analyze_broad(posts_with_comments, model):
     """宽泛模式：Claude 自主选出最有价值的产品机会并深度分析"""
     combined = build_post_texts(posts_with_comments)
     total_comments = sum(len(p.get('comments', [])) for p in posts_with_comments)
+    today = datetime.date.today().isoformat()
 
     scoring_block = SCORING_INSTRUCTIONS.format(
         post_count=len(posts_with_comments),
         comment_count=total_comments
     )
 
-    prompt = f"""你是一名资深跨境电商选品分析师。以下是来自多个 Reddit 版块的真实用户讨论（共 {len(posts_with_comments)} 个帖子，约 {total_comments} 条评论）。
+    prompt = f"""你是一名资深跨境电商选品分析师。今天是 {today}。
+
+以下是来自多个 Reddit 版块的真实用户讨论（共 {len(posts_with_comments)} 个帖子，约 {total_comments} 条评论），数据采集时间为今天（{today}）。
 
 **你的任务**：
 1. 从这些数据中**自主识别** 1 个最有价值的产品机会
@@ -432,6 +435,7 @@ def analyze_broad(posts_with_comments, model):
 ## 目标买家画像
 
 ## 本次研究数据
+（必须包含：覆盖版块、扫描帖数、精选讨论数、关键词范围。**数据采集时间必须写当天日期 {today}，不要凭印象写成其他年份**）
 
 ---
 
@@ -455,15 +459,16 @@ def analyze_targeted(posts_with_comments, product, model):
     """定向模式：深度分析指定产品的买家痛点"""
     combined = build_post_texts(posts_with_comments)
     total_comments = sum(len(p.get('comments', [])) for p in posts_with_comments)
+    today = datetime.date.today().isoformat()
 
     scoring_block = SCORING_INSTRUCTIONS.format(
         post_count=len(posts_with_comments),
         comment_count=total_comments
     )
 
-    prompt = f"""你是一名资深跨境电商选品分析师，正在研究「{product}」这个品类的 Reddit 买家真实讨论。
+    prompt = f"""你是一名资深跨境电商选品分析师，正在研究「{product}」这个品类的 Reddit 买家真实讨论。今天是 {today}。
 
-以下是从 Reddit 相关版块收集的帖子和评论数据（共 {len(posts_with_comments)} 个帖子，约 {total_comments} 条评论）。
+以下是从 Reddit 相关版块收集的帖子和评论数据（共 {len(posts_with_comments)} 个帖子，约 {total_comments} 条评论），数据采集时间为今天（{today}）。
 
 请对「{product}」进行深度买家痛点研究，严格按以下格式输出完整报告：
 
@@ -485,6 +490,7 @@ def analyze_targeted(posts_with_comments, product, model):
 ## 目标买家画像
 
 ## 本次研究数据
+（必须包含：覆盖版块 / 搜索关键词数 / 扫描帖数 / 精选讨论数。**数据采集时间必须写当天日期 {today}，不要凭印象写成其他年份**）
 
 ---
 

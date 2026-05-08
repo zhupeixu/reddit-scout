@@ -28,6 +28,8 @@ DEFAULT_BITABLE = {
     "table_posts": "tblFestqjfCZ2fwE",       # Reddit热帖
 }
 
+SELLERSPRITE_MCP_URL = "https://mcp.sellersprite.com/mcp"
+
 # ── 默认配置 ────────────────────────────────────────────────────
 DEFAULT_MODEL = "claude-sonnet-4-6"
 COMMENTS_PER_POST = 30
@@ -241,16 +243,27 @@ def discover_relevant_subreddits(product, cookie_str, top_n=10):
     过滤噪音黑名单后取 top_n。
     """
     NOISE_SUBREDDITS = {
+        # 大型综合/娱乐
         'nba', 'nfl', 'soccer', 'baseball', 'hockey', 'mma', 'formula1',
         'politics', 'worldnews', 'news', 'AskReddit', 'funny', 'pics',
         'memes', 'wallstreetbets', 'Superstonk', 'CryptoCurrency',
-        'SubredditDrama', 'BestofRedditorUpdates', 'tifu', 'AmItheAsshole',
-        'relationship_advice', 'todayilearned', 'mildlyinteresting',
-        'unpopularopinion', 'TwoXChromosomes', 'gaming', 'pcmasterrace',
+        'todayilearned', 'mildlyinteresting', 'unpopularopinion',
+        'TwoXChromosomes', 'gaming', 'pcmasterrace',
         'movies', 'television', 'music', 'KpopFap', 'kpop', 'popheads',
         'taylorswift', 'beatles', 'leagueoflegends', 'DotA2',
-        'nosleep', 'TrueCrimeDiscussion', 'BORUpdates', 'TopCharacterTropes',
+        'GTA6', 'marvelrivals', 'Helldivers',
+        # 故事/吐槽八卦类（容易被任意关键词命中）
+        'SubredditDrama', 'BestofRedditorUpdates', 'BORUpdates',
+        'tifu', 'AmItheAsshole', 'AITAH', 'AmIOverreacting',
+        'pettyrevenge', 'MaliciousCompliance', 'weddingshaming',
+        'relationship_advice', 'TopCharacterTropes',
+        'nosleep', 'TrueCrimeDiscussion', 'HFY', 'SipsTea',
+        # 时尚/美妆/动物可爱
         'MadeMeSmile', 'MapPorn', 'bald', 'cats', 'dogs', 'aww',
+        'RedditLaqueristas', 'MakeupAddiction', 'AnimalCrossing',
+        'FinalFantasyIX', 'StarWars', 'ClosetWeed',
+        # 城市/旅游/综合区域（除非产品就是地理相关）
+        'LosAngeles', 'Defeat_Project_2025', 'architecture',
     }
     NOISE_LOWER = {s.lower() for s in NOISE_SUBREDDITS}
 
@@ -298,6 +311,273 @@ def discover_relevant_subreddits(product, cookie_str, top_n=10):
             break
     return out[:top_n]
 
+
+# ── Sellersprite 亚马逊数据验证 ─────────────────────────────
+
+def _sellersprite_secret_key():
+    """从 ~/.claude.json 读取 sellersprite secret-key"""
+    cfg_path = os.path.expanduser("~/.claude.json")
+    if not os.path.exists(cfg_path):
+        return None
+    try:
+        cfg = json.load(open(cfg_path))
+        url = cfg.get("mcpServers", {}).get("sellersprite", {}).get("url", "")
+        if "?" not in url:
+            return None
+        qs = urllib.parse.parse_qs(url.split("?", 1)[1])
+        for v in qs.values():
+            if v and v[0]:
+                return v[0]
+    except Exception:
+        return None
+    return None
+
+
+def sellersprite_call(tool_name, args, secret_key=None, timeout=30):
+    """通过 HTTP JSON-RPC 调 sellersprite MCP（不依赖 Claude session 的 MCP 集成）"""
+    if secret_key is None:
+        secret_key = _sellersprite_secret_key()
+    if not secret_key:
+        return None
+    body = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": args}
+    }
+    try:
+        r = subprocess.run([
+            "curl", "-s", "-m", str(timeout), "-X", "POST",
+            f"{SELLERSPRITE_MCP_URL}?secret-key={secret_key}",
+            "-H", "Content-Type: application/json",
+            "-H", "Accept: application/json, text/event-stream",
+            "-d", json.dumps(body, ensure_ascii=False)
+        ], capture_output=True, text=True, timeout=timeout + 5)
+    except subprocess.TimeoutExpired:
+        return None
+    if not r.stdout.strip().startswith("{"):
+        return None
+    try:
+        resp = json.loads(r.stdout)
+        if "error" in resp:
+            return None
+        text = resp["result"]["content"][0]["text"]
+        return json.loads(text)
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return None
+
+
+def amazon_validate(direction, max_skus=10, max_review_brands=3):
+    """
+    用 sellersprite 做亚马逊验证：
+    - 找最相关类目（避开手机屏保/食品等字面巧合误命中）
+    - 抓 Top 销量 SKU（按月销）
+    - 抓 Top 2-3 品牌的差评（避免同品牌多变体重复）
+    - 抓关键词市场数据（搜索量/增长/供需比/平均价/头部品牌）
+
+    返回 dict 或 None（失败时）
+    """
+    print(f"🛒 Sellersprite Amazon 验证（方向: {direction}）...", flush=True)
+
+    # Step 1: 找类目
+    nodes_resp = sellersprite_call("product_node", {
+        "request": {"marketplace": "US", "keyword": direction}
+    })
+    nodes = []
+    if nodes_resp and isinstance(nodes_resp.get("data"), list):
+        nodes = nodes_resp["data"]
+    if not nodes:
+        print("   ⚠️  未找到匹配类目，跳过 Amazon 验证")
+        return None
+
+    # 过滤明显跨品类的（cell phones, beauty 等容易因为字面词命中但跟产品无关）
+    NEUTRAL_KEYWORDS = ["camping", "outdoor", "sports", "garden", "kitchen",
+                         "home", "tool", "patio", "office", "pet", "automotive",
+                         "baby", "toys", "health", "beauty", "clothing"]
+    # 含有产品方向关键词的类目优先
+    direction_words = [w.lower() for w in direction.split() if len(w) >= 3]
+    relevant = []
+    for n in nodes:
+        path = n.get("nodeLabelPath", "").lower()
+        if any(w in path for w in direction_words):
+            relevant.append(n)
+    if not relevant:
+        relevant = [n for n in nodes if any(k in n.get("nodeLabelPath", "").lower() for k in NEUTRAL_KEYWORDS)]
+    if not relevant:
+        relevant = nodes
+    relevant.sort(key=lambda x: x.get("products", 0), reverse=True)
+    top_node = relevant[0]
+    print(f"   📂 类目: {top_node['nodeLabelPath']} ({top_node.get('products', '?')} 商品)")
+
+    # Step 2: 抓 Top SKU（用上个月数据）
+    last_month = (datetime.date.today().replace(day=1) - datetime.timedelta(days=1)).strftime("%Y%m")
+    skus_resp = sellersprite_call("product_research", {
+        "request": {
+            "marketplace": "US",
+            "nodeIdPath": top_node["nodeIdPath"],
+            "nodeIdPathEqual": False,
+            "month": last_month,
+            "minUnits": 50,
+            "size": max_skus,
+            "order": {"field": "total_units", "desc": True}
+        }
+    })
+    items = []
+    if skus_resp and isinstance(skus_resp.get("data"), dict):
+        items = skus_resp["data"].get("items", []) or []
+    items.sort(key=lambda x: x.get("units") or 0, reverse=True)
+    print(f"   🏆 Top {len(items)} SKU 抓到（{last_month} 月销数据）")
+
+    if not items:
+        return {
+            "category": top_node["nodeLabelPath"],
+            "category_products_total": top_node.get("products"),
+            "month": last_month,
+            "top_skus": [],
+            "negative_reviews": [],
+            "keyword_market": []
+        }
+
+    # Step 3: 抓 Top 品牌差评（同品牌只取一个变体，避免重复）
+    category_id_root = top_node["nodeIdPath"].split(":")[0]
+    reviews_by_brand = []
+    seen_brands = set()
+    for it in items:
+        if len(reviews_by_brand) >= max_review_brands:
+            break
+        brand = it.get("brand", "?") or "?"
+        if brand in seen_brands:
+            continue
+        seen_brands.add(brand)
+        rev = sellersprite_call("review", {
+            "marketplace": "US",
+            "asin": it["asin"],
+            "categoryId": category_id_root,
+            "starList": [1, 2, 3],
+            "size": 8
+        })
+        review_items = []
+        if rev and isinstance(rev.get("data"), dict):
+            review_items = rev["data"].get("items", []) or []
+        if review_items:
+            reviews_by_brand.append({
+                "asin": it["asin"],
+                "brand": brand,
+                "title": (it.get("title") or "")[:80],
+                "samples": [
+                    {
+                        "star": r.get("star"),
+                        "title": (r.get("title") or "")[:80],
+                        "content": (r.get("content") or "").replace("<br>", " ")[:280]
+                    }
+                    for r in review_items[:6]
+                ]
+            })
+    total_reviews = sum(len(b["samples"]) for b in reviews_by_brand)
+    print(f"   💬 抓到 {total_reviews} 条差评 / {len(reviews_by_brand)} 个 Top 品牌")
+
+    # Step 4: 关键词市场分析
+    kw_resp = sellersprite_call("keyword_research", {
+        "request": {"keywords": direction, "marketplace": "US"}
+    })
+    keyword_market = []
+    if kw_resp and isinstance(kw_resp.get("data"), dict):
+        kws = kw_resp["data"].get("items", []) or []
+        for k in kws[:3]:
+            keyword_market.append({
+                "keyword": k.get("keywords"),
+                "monthly_searches": k.get("searches"),
+                "growth_pct": round((k.get("growth") or 0) * 100, 1),
+                "supply_demand_ratio": k.get("supplyDemandRatio"),
+                "avg_price": k.get("avgPrice"),
+                "bid_avg": k.get("bid"),
+                "top_brands": ", ".join((k.get("brands") or [])[:3]),
+            })
+    if keyword_market:
+        print(f"   🔍 关键词市场: {len(keyword_market)} 词数据")
+
+    return {
+        "category": top_node["nodeLabelPath"],
+        "category_products_total": top_node.get("products"),
+        "month": last_month,
+        "top_skus": [
+            {
+                "asin": it["asin"],
+                "brand": it.get("brand"),
+                "title": (it.get("title") or "")[:80],
+                "price": it.get("price"),
+                "units_monthly": it.get("units"),
+                "revenue_monthly": it.get("revenue"),
+                "rating": it.get("rating"),
+                "ratings_count": it.get("ratings"),
+                "bsr": it.get("bsr"),
+                "is_amazon_self": it.get("sellerName") == "Amazon",
+            }
+            for it in items[:max_skus]
+        ],
+        "negative_reviews": reviews_by_brand,
+        "keyword_market": keyword_market,
+    }
+
+
+def format_amazon_section_for_prompt(amazon_data):
+    """把 Amazon 数据格式化成文本片段，塞到 Claude 分析 prompt 里"""
+    if not amazon_data:
+        return ""
+    skus = amazon_data.get("top_skus", [])
+    skus_lines = "\n".join(
+        f"  · {s['asin']} | {s.get('brand','?')} | ${s.get('price','?')} | "
+        f"月销 {s.get('units_monthly','?')} 单 / ${(s.get('revenue_monthly') or 0):,.0f} | "
+        f"{s.get('rating','?')}★({s.get('ratings_count','?')}评) | BSR {s.get('bsr','?')} | "
+        f"{(s.get('title') or '')[:55]}"
+        for s in skus[:8]
+    ) or "  （无数据）"
+
+    review_blocks = []
+    for nr in amazon_data.get("negative_reviews", []):
+        samples = "\n".join(
+            f"      [{s.get('star','?')}★] {s.get('title','')}: {(s.get('content') or '')[:200]}"
+            for s in nr["samples"][:5]
+        )
+        review_blocks.append(f"    {nr['brand']} ({nr['asin']}):\n{samples}")
+    reviews_text = "\n".join(review_blocks) or "  （无数据）"
+
+    kw = amazon_data.get("keyword_market", [])
+    kw_lines = "\n".join(
+        f"  · {k['keyword']}: 月搜 {k.get('monthly_searches','?')} | "
+        f"近期增长 {k.get('growth_pct','?')}% | 供需比 {k.get('supply_demand_ratio','?')} | "
+        f"均价 ${k.get('avg_price','?')} | PPC ${k.get('bid_avg','?')} | 头部 {k.get('top_brands','')}"
+        for k in kw
+    ) or "  （无数据）"
+
+    return f"""
+
+---
+
+**【亚马逊市场实证数据 — Sellersprite {amazon_data.get('month','')}】**
+
+**类目**：{amazon_data.get('category','?')}（共 {amazon_data.get('category_products_total','?')} 个商品）
+
+**Top {len(skus)} 销量 SKU（按月销量降序）**:
+{skus_lines}
+
+**Top 品牌的差评样本（与 Reddit 痛点对比，找差异化空间）**:
+{reviews_text}
+
+**关键词市场**:
+{kw_lines}
+
+---
+
+**重要要求**：你的报告**必须把上述亚马逊数据融入分析**，不能只看 Reddit：
+- 「双重验证」：Reddit 痛点中哪些在 Top SKU 差评里也出现了？
+- 头部 SKU 的品牌集中度、定价区间、评分分布说明什么？
+- 关键词搜索量 + 增长率 + 供需比 → 市场是热是冷？是上升还是下行？
+- 你的产品方向相比 Top SKU 的**具体差异化点**是什么？是否解决了它们差评里的问题？
+- **机会评分必须把市场规模（关键词月搜量 × 头部 SKU 月销额）+ 竞争程度（供需比 + 品牌集中度）+ 差异化空间（差评指向的具体改进）三者都纳入**
+"""
+
+
+# ── Reddit 帖子相关度过滤（Haiku） ─────────────────────────────
 
 def filter_posts_by_relevance(posts, product, model="claude-haiku-4-5-20251001"):
     """
@@ -368,13 +648,15 @@ def plan_search(product, model, candidate_subs=None):
             f"- r/{c['subreddit']}（{c['posts']} 帖 / {c['total_score']} 累计赞）"
             for c in candidate_subs
         )
-        sub_instruction = f"""**候选 subreddit 列表**（基于 Reddit 真实搜索数据，按相关性降序）：
+        sub_instruction = f"""**候选 subreddit 列表**（来自 Reddit 实际搜索数据，按相关性降序）：
 {cand_lines}
 
-**严格要求**：
-- subreddits 字段**必须从上面列表中选 3-5 个**，按真实买家讨论密度判断
-- 排除明显不相关的（比如产品名是 "picnic blanket" 时，r/pickling 这种字面巧合的不要）
-- 不要凭印象添加未在候选列表中的版块"""
+**选 subreddit 的指南**：
+1. **优先从候选列表挑**真正与该产品/品类强相关的 3-5 个版块
+2. **如果候选明显不相关**（全是综合水版/字面巧合），允许补充 1-3 个**已知该品类专属的版块**（比如露营产品可补 r/CampingGear, r/CarCamping, r/Overlanding；母婴可补 r/beyondthebump 等）
+3. 排除字面巧合（产品名 "picnic blanket" 时，不要选 r/pickling）
+4. 排除综合大水版（pettyrevenge / AITAH / mildlyinfuriating 等不能反映买家讨论）
+5. 加入候选列表外的版块时，必须确信该版块**真的存在**且**真的与产品品类强相关**"""
     else:
         sub_instruction = """- subreddits：3-5 个，选择最可能有该产品**真实买家**讨论的版块（英文，不带 r/）
 - 不要选男性时尚版块给女性产品；避免字面巧合（picnic vs pickling）"""
@@ -535,6 +817,7 @@ def bitable_json_instruction(num_opportunities):
       "subreddits": "覆盖版块（如 r/Cooking, r/BuyItForLife）",
       "selected_posts": 1,
       "notes": "评分依据：本次数据 N 帖 / M 评论 / 累计 K 赞讨论；样本规模声明",
+      "amazon_validation": "如有亚马逊数据则填这里：类目+Top SKU 销量/品牌集中度+关键词市场+差评中与 Reddit 共振的痛点+建议定价。无亚马逊数据则留空字符串。",
       "evidence_posts": [
         {{
           "title": "Reddit 帖子标题原文",
@@ -622,8 +905,8 @@ def analyze_broad(posts_with_comments, model):
     return stream_with_retry(model, 8000, prompt)
 
 
-def analyze_targeted(posts_with_comments, product, model):
-    """定向模式：深度分析指定产品的买家痛点"""
+def analyze_targeted(posts_with_comments, product, model, amazon_data=None):
+    """定向模式：深度分析指定产品的买家痛点。amazon_data 可选，传入则融合 Amazon 实证。"""
     combined = build_post_texts(posts_with_comments)
     total_comments = sum(len(p.get('comments', [])) for p in posts_with_comments)
     today = datetime.date.today().isoformat()
@@ -634,51 +917,58 @@ def analyze_targeted(posts_with_comments, product, model):
         comment_count=total_comments
     )
 
+    amazon_section = format_amazon_section_for_prompt(amazon_data)
+    has_amazon = bool(amazon_data and amazon_data.get("top_skus"))
+
     prompt = f"""你是一名资深跨境电商选品分析师，正在研究「{product}」这个品类的 Reddit 买家真实讨论。今天是 {today}。
 
 以下是从 Reddit 相关版块收集的帖子和评论数据（共 {len(posts_with_comments)} 个帖子，约 {total_comments} 条评论），数据采集时间为今天（{today}）。
 
 **帖子时间分布**：{date_dist}
 （每个帖子在原始数据里都标注了发帖日期，请在分析中诚实指出"信号是近期的还是历史性的"——如果某痛点引用的帖子大多在 180 天前，要在评分中体现"信号陈旧风险"）
-
+{amazon_section}
 请对「{product}」进行深度买家痛点研究，严格按以下格式输出完整报告：
 
 ---
 
-## {product}：Reddit 买家痛点深度研究
+## {product}：Reddit + Amazon 买家痛点深度研究
 
 **品类背景**（2-3句）
 
 ### 痛点一/二/三/四：[标题]
 （痛点本质 + Reddit 证据：r/XX，「帖子标题」（X赞/X评）+ 用户原话引用 + 市场分析）
+{"（**注意：每个痛点请尽量结合 Amazon Top SKU 差评做'双重验证'**——如果 Reddit 抱怨的问题在亚马逊差评里也出现，单独标注「Amazon 差评同源」并引用具体差评原话）" if has_amazon else ""}
 
 ## 机会点 ①②③（具体规格/材质/做法/定价）
+{"（定价区间必须参考 Amazon Top SKU 实际价位段，差异化点必须解决至少 1 条 Top SKU 差评中的问题）" if has_amazon else ""}
 
 ## 竞品现状
+{"（**必须用上方亚马逊数据**：Top 销量品牌、定价区间、品牌集中度、自营 vs 第三方占比）" if has_amazon else ""}
 
 {scoring_block}
+{"（**机会评分维度必须改用 Amazon 数据**：市场规模 = 头部 SKU 月销额累计；竞争程度 = 品牌集中度 + 供需比；差异化可行性 = 差评指向的可解决问题）" if has_amazon else ""}
 
 ## 目标买家画像
 
 ## 本次研究数据
-（必须包含：覆盖版块 / 搜索关键词数 / 扫描帖数 / 精选讨论数。**数据采集时间必须写当天日期 {today}，不要凭印象写成其他年份**）
+（必须包含：覆盖版块 / 搜索关键词数 / 扫描帖数 / 精选讨论数 / **Amazon 类目 / Top SKU 数 / 关键词月搜量**。**数据采集时间必须写当天日期 {today}**）
 
 ---
 
 要求：
 - 只分析数据中真实出现的痛点，不要虚构
-- 每个痛点必须有具体 Reddit 帖子作为证据
+- 每个痛点必须有具体 Reddit 帖子作为证据；如果 Amazon 数据可用，优先做"Reddit 痛点 + Amazon 差评"双重验证
 - 机会评分必须用上方表格中的数据支撑
 - 机会点要具体可执行（有具体规格/材质/做法）
-- 整体不少于 1000 字
+- 整体不少于 1200 字（融合 Amazon 数据后内容更丰富）
 {bitable_json_instruction(1)}
 
 以下是 Reddit 原始数据：
 
-{combined[:18000]}
+{combined[:14000]}
 """
 
-    print(f"\n🤖 深度分析中（模型：{model}）...\n")
+    print(f"\n🤖 深度分析中（模型：{model}{'，含 Amazon 数据' if has_amazon else ''}）...\n")
     return stream_with_retry(model, 8000, prompt)
 
 
@@ -853,6 +1143,8 @@ def push_to_bitable(report_text, mode, input_direction, doc_url, scan_summary):
             "飞书文档": doc_url,
             "备注": opp.get("notes"),
         }
+        if opp.get("amazon_validation"):
+            record["亚马逊验证"] = opp["amazon_validation"]
         rid = push_record(base, t1, record)
         if rid:
             print(f"  ✅ [{i}/{len(opps)}] 选品记录: {opp.get('product_name')} → {rid}")
@@ -940,7 +1232,7 @@ def run_broad_mode(cookie_str, args):
         print(f"  💬 [{p['num_comments']}评] r/{p['subreddit']} — {p['title'][:65]}", flush=True)
         p['comments'] = fetch_comments(p['id'], p['subreddit'], cookie_str)
         pwc.append(p)
-        time.sleep(0.8)
+        time.sleep(0.3)
 
     report = analyze_broad(pwc, args.model)
     path = save_report(report, "broad", args.output)
@@ -983,7 +1275,7 @@ def run_targeted_mode(cookie_str, args):
             for p in new: seen.add(p['id'])
             all_posts.extend(new)
             print(f"{len(new)} 帖", flush=True)
-            time.sleep(1.2)
+            time.sleep(0.5)
     for kw in keywords[2:]:
         print(f"  🌐 全站 ← \"{kw}\"...", end=" ", flush=True)
         posts = search_reddit(kw, cookie_str=cookie_str)
@@ -991,7 +1283,7 @@ def run_targeted_mode(cookie_str, args):
         for p in new: seen.add(p['id'])
         all_posts.extend(new)
         print(f"{len(new)} 帖", flush=True)
-        time.sleep(1.2)
+        time.sleep(0.5)
     print(f"\n共找到 {len(all_posts)} 篇帖子（去重后）")
 
     if filter_words:
@@ -1010,7 +1302,7 @@ def run_targeted_mode(cookie_str, args):
         print(f"  💬 [{p['num_comments']}评] r/{p['subreddit']} — {p['title'][:60]}", flush=True)
         p['comments'] = fetch_comments(p['id'], p['subreddit'], cookie_str)
         pwc.append(p)
-        time.sleep(0.8)
+        time.sleep(0.3)
 
     report = analyze_targeted(pwc, product, args.model)
     path = save_report(report, product, args.output)
@@ -1030,7 +1322,7 @@ def run_weekly_mode(cookie_str, args):
         posts = fetch_posts_from_sub(sub, sort, tf, cookie_str, limit=WEEKLY_POSTS_PER_SUB)
         print(f"{len(posts)} 帖", flush=True)
         all_posts.extend(posts)
-        time.sleep(1.2)
+        time.sleep(0.5)
 
     seen, uniq = set(), []
     for p in all_posts:

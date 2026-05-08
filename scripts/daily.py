@@ -19,7 +19,7 @@ from scout import (
     load_bitable_config, get_cookies, plan_search, search_reddit,
     fetch_comments, save_report, create_feishu_doc, push_to_bitable,
     extract_bitable_data, analyze_targeted, discover_relevant_subreddits,
-    filter_posts_by_relevance,
+    filter_posts_by_relevance, amazon_validate,
     MAX_POSTS_FOR_ANALYSIS, DEFAULT_MODEL,
 )
 
@@ -104,11 +104,10 @@ def pick_fresh_direction(recent_names, recent_dirs, model=MODEL):
     return json.loads(raw)
 
 
-def build_card(opp, direction, reason, doc_url, bitable_url, scan):
+def build_card(opp, direction, reason, doc_url, bitable_url, scan, amazon_info=None):
     """构造飞书交互式卡片 JSON"""
     today = datetime.date.today().isoformat()
     score = opp.get("score", "?")
-    # 评分→header 颜色
     template = "red" if isinstance(score, (int, float)) and score >= 8 else \
                "blue" if isinstance(score, (int, float)) and score >= 6.5 else "grey"
 
@@ -117,6 +116,7 @@ def build_card(opp, direction, reason, doc_url, bitable_url, scan):
     comp = (opp.get("competition_summary") or "").strip()
     persona = (opp.get("buyer_persona") or "").strip()
     notes = (opp.get("notes") or "").strip()
+    amazon_summary = (opp.get("amazon_validation") or "").strip()
 
     elements = [
         {
@@ -136,6 +136,30 @@ def build_card(opp, direction, reason, doc_url, bitable_url, scan):
     ]
     if comp:
         elements.append({"tag": "markdown", "content": f"**🏪 竞品现状**\n{comp}"})
+
+    # Amazon 验证区块
+    if amazon_info or amazon_summary:
+        elements.append({"tag": "hr"})
+        if amazon_info:
+            top_skus = amazon_info.get("top_skus", [])[:3]
+            kw_market = amazon_info.get("keyword_market", [])[:1]
+            kw_text = ""
+            if kw_market:
+                k = kw_market[0]
+                kw_text = (f"  · {k.get('keyword','?')} 月搜 **{k.get('monthly_searches','?')}** | "
+                           f"增长 {k.get('growth_pct','?')}% | 均价 ${k.get('avg_price','?')} | "
+                           f"PPC ${k.get('bid_avg','?')} | 头部 {k.get('top_brands','')}\n")
+            sku_text = "\n".join(
+                f"  · {s.get('brand','?')} ${s.get('price','?')} · 月销 **{s.get('units_monthly','?')}** "
+                f"({s.get('rating','?')}★/{s.get('ratings_count','?')}评)"
+                for s in top_skus
+            ) or "  暂无数据"
+            cat = amazon_info.get("category", "?").split(":")[-1]
+            elements.append({"tag": "markdown",
+                "content": f"**🛒 亚马逊验证（{amazon_info.get('month','')}，类目: {cat}）**\n\n{kw_text}\n**Top 3 SKU:**\n{sku_text}"})
+        if amazon_summary:
+            elements.append({"tag": "markdown", "content": f"**📌 亚马逊洞察**\n{amazon_summary}"})
+
     if persona:
         elements.append({"tag": "markdown", "content": f"**🎯 目标买家**\n{persona}"})
     if notes:
@@ -200,6 +224,9 @@ def run_targeted_inline(direction, model):
     print(f"📋 Subreddits: {', '.join(subreddits)}")
     print(f"🔍 关键词: {', '.join(keywords)}")
 
+    # Amazon 验证（与 Reddit 抓取并行不了——但单独跑也很快，10-30s）
+    amazon_info = amazon_validate(direction)
+
     def search_with_timeframe(tf, subs_to_use, per_sub_limit=15, global_limit=20):
         """按指定时间窗口跑一遍搜索 + 过滤，返回相关帖列表"""
         local_posts, local_seen = [], set()
@@ -210,14 +237,14 @@ def run_targeted_inline(direction, model):
                 for p in posts:
                     if p['id'] not in local_seen:
                         local_seen.add(p['id']); local_posts.append(p)
-                time.sleep(1.0)
+                time.sleep(0.4)
         for kw in keywords[2:]:
             posts = search_reddit(kw, cookie_str=cookie_str,
                                   timeframe=tf, limit=global_limit)
             for p in posts:
                 if p['id'] not in local_seen:
                     local_seen.add(p['id']); local_posts.append(p)
-            time.sleep(1.0)
+            time.sleep(0.4)
         if filter_words:
             return [p for p in local_posts
                     if any(w.lower() in (p['title'] + ' ' + p['selftext']).lower() for w in filter_words)]
@@ -257,7 +284,7 @@ def run_targeted_inline(direction, model):
                 for p in posts:
                     if p['id'] not in existing_ids:
                         existing_ids.add(p['id']); new_posts.append(p)
-                time.sleep(0.8)
+                time.sleep(0.3)
         # filter_words 过滤
         if filter_words:
             new_posts = [p for p in new_posts
@@ -284,21 +311,22 @@ def run_targeted_inline(direction, model):
     hot = relevant[:MAX_POSTS_FOR_ANALYSIS]
     print(f"📖 抓 {len(hot)} 帖评论...")
 
-    # 0 帖保护：避免在空数据上让 Claude 凭空编造报告
+    # Reddit 是主信号源，Amazon 只能辅证。
+    # Reddit 帖 < 3 说明信号不足以产出可信报告——直接抛错，绝不用 Amazon 顶替。
     if len(hot) < 3:
         raise RuntimeError(
-            f"找到的相关帖子不足 3 篇（实际 {len(hot)} 篇）。"
-            f"可能版块/关键词与产品脱节。终止以防伪造报告。"
+            f"Reddit 相关帖不足 3 篇（实际 {len(hot)} 篇）。"
+            f"Reddit 是主信号源，Amazon 数据仅辅证，样本不足终止以防伪造报告。"
         )
 
     pwc = []
     for p in hot:
         p['comments'] = fetch_comments(p['id'], p['subreddit'], cookie_str)
         pwc.append(p)
-        time.sleep(0.6)
+        time.sleep(0.3)
 
-    report = analyze_targeted(pwc, direction, model)
-    return report, pwc, subreddits
+    report = analyze_targeted(pwc, direction, model, amazon_data=amazon_info)
+    return report, pwc, subreddits, amazon_info
 
 
 def main():
@@ -309,13 +337,29 @@ def main():
     print(f"   过去 {DAYS_LOOKBACK} 天已分析：{len(names)} 个产品 / {len(set(dirs))} 次运行", flush=True)
 
     print("🧠 选择今日新方向...", flush=True)
-    pick = pick_fresh_direction(names, dirs)
-    direction = pick["direction"]
-    category = pick.get("category", "?")
-    reason = pick.get("reason_cn", "")
-    print(f"🎯 今日选定：{direction}（{category}）\n   {reason}", flush=True)
+    # 重试机制：当 Reddit 数据不足触发 RuntimeError 时，自动换方向（最多 3 次）
+    MAX_RETRIES = 3
+    failed_directions = []
+    for attempt in range(MAX_RETRIES):
+        # 把已失败方向也加到避重列表，避免再选
+        pick = pick_fresh_direction(names + failed_directions, dirs + failed_directions)
+        direction = pick["direction"]
+        category = pick.get("category", "?")
+        reason = pick.get("reason_cn", "")
+        if attempt > 0:
+            print(f"\n🔄 第 {attempt+1} 次尝试", flush=True)
+        print(f"🎯 今日选定：{direction}（{category}）\n   {reason}", flush=True)
+        try:
+            report, pwc, subreddits, amazon_info = run_targeted_inline(direction, MODEL)
+            break
+        except RuntimeError as e:
+            print(f"⚠️  方向「{direction}」失败：{e}", flush=True)
+            failed_directions.append(direction)
+            if attempt == MAX_RETRIES - 1:
+                print(f"❌ 已重试 {MAX_RETRIES} 次仍失败，终止", flush=True)
+                raise
+            continue
 
-    report, pwc, subreddits = run_targeted_inline(direction, MODEL)
     report_path = save_report(report, direction)
     print(f"\n✅ 报告：{report_path}", flush=True)
 
@@ -338,7 +382,7 @@ def main():
         print("⚠️  报告里没有 BITABLE_DATA，跳过卡片发送", flush=True)
         sys.exit(2)
 
-    card = build_card(structured["opportunities"][0], direction, reason, doc_url, bitable_url, scan)
+    card = build_card(structured["opportunities"][0], direction, reason, doc_url, bitable_url, scan, amazon_info)
     success = send_card(DAILY_RECIPIENT_OPEN_ID, card)
     print(f"💬 私信卡片发送：{'✅' if success else '❌'}", flush=True)
     print(f"\n🎉 完成（{datetime.datetime.now().isoformat()}）", flush=True)

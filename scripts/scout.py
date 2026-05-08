@@ -389,24 +389,67 @@ def amazon_validate(direction, max_skus=10, max_review_brands=3):
         print("   ⚠️  未找到匹配类目，跳过 Amazon 验证")
         return None
 
-    # 过滤明显跨品类的（cell phones, beauty 等容易因为字面词命中但跟产品无关）
-    NEUTRAL_KEYWORDS = ["camping", "outdoor", "sports", "garden", "kitchen",
-                         "home", "tool", "patio", "office", "pet", "automotive",
-                         "baby", "toys", "health", "beauty", "clothing"]
-    # 含有产品方向关键词的类目优先
-    direction_words = [w.lower() for w in direction.split() if len(w) >= 3]
-    relevant = []
-    for n in nodes:
-        path = n.get("nodeLabelPath", "").lower()
-        if any(w in path for w in direction_words):
-            relevant.append(n)
-    if not relevant:
-        relevant = [n for n in nodes if any(k in n.get("nodeLabelPath", "").lower() for k in NEUTRAL_KEYWORDS)]
-    if not relevant:
-        relevant = nodes
-    relevant.sort(key=lambda x: x.get("products", 0), reverse=True)
-    top_node = relevant[0]
-    print(f"   📂 类目: {top_node['nodeLabelPath']} ({top_node.get('products', '?')} 商品)")
+    # 类目选择：先初筛候选，让 Haiku 在候选里挑最匹配的
+    # 步骤 1：先把明显大杂烩水类目 + 字面命中歧义的过滤掉，留下 30 个候选
+    GENERIC_WORDS = {
+        'portable', 'outdoor', 'indoor', 'home', 'best', 'pro', 'mini',
+        'large', 'small', 'medium', 'mens', 'womens', 'kids', 'baby',
+        'electric', 'manual', 'wireless', 'rechargeable', 'foldable',
+        'compact', 'lightweight', 'heavy', 'duty', 'professional',
+        'premium', 'cheap', 'travel', 'camping', 'car',
+    }
+    direction_words_all = [w.lower() for w in direction.split() if len(w) >= 3]
+    direction_core = [w for w in direction_words_all if w not in GENERIC_WORDS]
+
+    # 初筛：含核心词的优先；否则含任意非通用词；否则含通用词；最后兜底
+    matched_core = [n for n in nodes
+                     if direction_core and any(w in n.get("nodeLabelPath", "").lower() for w in direction_core)]
+    matched_any = [n for n in nodes
+                    if any(w in n.get("nodeLabelPath", "").lower() for w in direction_words_all)]
+    candidates = matched_core if matched_core else (matched_any if matched_any else nodes)
+    # 排除明显超大杂烩（>50000 通常是装饰/配件大类目）和过小（<200 数据稀疏）
+    filtered = [n for n in candidates if 200 <= (n.get("products") or 0) <= 50000]
+    if not filtered:
+        filtered = candidates
+    # 取 top 25 候选给 Haiku 选
+    filtered.sort(key=lambda x: x.get("products", 0), reverse=True)
+    candidates_top = filtered[:25]
+
+    # 步骤 2：让 Haiku 看候选挑最匹配的
+    cand_lines = "\n".join(
+        f"{i+1}. {n['nodeLabelPath']} ({n.get('products', '?')} 商品)"
+        for i, n in enumerate(candidates_top)
+    )
+    pick_prompt = f"""从以下亚马逊类目候选中，选出最适合分析「{direction}」这个产品的类目。
+
+判断标准：
+- **类目语义必须真的就是这个产品**（如 portable hammock stand 应选含 hammock 的类目，不是站立桨板 Stand-Up Paddleboarding 这种字面巧合）
+- 优先选**叶子层级深、语义精准**的类目，而不是含混大类目
+- 商品数量在 500-15000 之间最理想；过大数据多杂噪音，过小数据稀疏
+- 如果**没有真正匹配**的类目（产品在亚马逊还是新品类），返回 0
+
+候选：
+{cand_lines}
+
+只返回 1 个数字（候选序号 1-{len(candidates_top)}，或 0 表示都不匹配）。不要任何其他文字。"""
+    try:
+        pick_resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            messages=[{"role": "user", "content": pick_prompt}]
+        )
+        pick_idx = int(pick_resp.content[0].text.strip()) - 1
+        if 0 <= pick_idx < len(candidates_top):
+            top_node = candidates_top[pick_idx]
+        else:
+            print("   ⚠️  Haiku 判断无真匹配类目，跳过 Amazon 验证")
+            return None
+    except (ValueError, Exception) as e:
+        print(f"   ⚠️  Haiku 选类目失败 ({e})，回退到规模排序")
+        top_node = candidates_top[0] if candidates_top else None
+        if not top_node:
+            return None
+    print(f"   📂 类目（Haiku 挑选）: {top_node['nodeLabelPath']} ({top_node.get('products', '?')} 商品)")
 
     # Step 2: 抓 Top SKU（用上个月数据）
     last_month = (datetime.date.today().replace(day=1) - datetime.timedelta(days=1)).strftime("%Y%m")

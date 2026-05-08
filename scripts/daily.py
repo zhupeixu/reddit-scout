@@ -200,18 +200,20 @@ def run_targeted_inline(direction, model):
     print(f"📋 Subreddits: {', '.join(subreddits)}")
     print(f"🔍 关键词: {', '.join(keywords)}")
 
-    def search_with_timeframe(tf):
+    def search_with_timeframe(tf, subs_to_use, per_sub_limit=15, global_limit=20):
         """按指定时间窗口跑一遍搜索 + 过滤，返回相关帖列表"""
         local_posts, local_seen = [], set()
-        for sub in subreddits:
+        for sub in subs_to_use:
             for kw in keywords[:2]:
-                posts = search_reddit(kw, subreddit=sub, cookie_str=cookie_str, timeframe=tf)
+                posts = search_reddit(kw, subreddit=sub, cookie_str=cookie_str,
+                                      timeframe=tf, limit=per_sub_limit)
                 for p in posts:
                     if p['id'] not in local_seen:
                         local_seen.add(p['id']); local_posts.append(p)
                 time.sleep(1.0)
         for kw in keywords[2:]:
-            posts = search_reddit(kw, cookie_str=cookie_str, timeframe=tf)
+            posts = search_reddit(kw, cookie_str=cookie_str,
+                                  timeframe=tf, limit=global_limit)
             for p in posts:
                 if p['id'] not in local_seen:
                     local_seen.add(p['id']); local_posts.append(p)
@@ -221,21 +223,56 @@ def run_targeted_inline(direction, model):
                     if any(w.lower() in (p['title'] + ' ' + p['selftext']).lower() for w in filter_words)]
         return local_posts
 
-    # 优先用近 30 天数据；不足则回退到近 1 年
-    print("⏳ 优先抓近 30 天热帖...", flush=True)
-    relevant = search_with_timeframe("month")
-    print(f"   近 30 天 keyword/filter 通过帖: {len(relevant)}")
-    if len(relevant) < 3:
-        print("⏳ 近 30 天数据不足，回退到近 1 年...", flush=True)
-        relevant = search_with_timeframe("year")
-        print(f"   近 1 年 keyword/filter 通过帖: {len(relevant)}")
+    # === 第一轮：近 30 天 + 初始 subreddit 列表 ===
+    print("⏳ 第一轮：近 30 天 + 初始版块...", flush=True)
+    relevant = search_with_timeframe("month", subreddits)
+    print(f"   通过 keyword/filter: {len(relevant)} 帖")
 
-    # Haiku 相关度复核：去掉字面巧合的噪音帖
-    print("🧐 Haiku 复核相关度...", flush=True)
+    if len(relevant) < 5:
+        print("⏳ 数据不足，扩展到近 1 年...", flush=True)
+        relevant = search_with_timeframe("year", subreddits)
+        print(f"   近 1 年通过: {len(relevant)} 帖")
+
+    # === Haiku 复核第一轮 ===
+    print("🧐 Haiku 复核第一轮相关度...", flush=True)
     relevant, details = filter_posts_by_relevance(relevant, direction)
-    print(f"   相关度复核后剩余: {len(relevant)} 帖")
+    print(f"   复核后: {len(relevant)} 帖")
+
+    # === 第二轮：迭代深挖 ===
+    # 找出剩余帖来自的真版块（≥1 帖且不在原 subreddit 列表里），在那做深抓
+    if relevant:
+        confirmed_subs = {}
+        for p in relevant:
+            s = p['subreddit']
+            confirmed_subs[s] = confirmed_subs.get(s, 0) + 1
+        # 保留 ≥1 帖的版块作为下轮深挖目标（含原列表里的）
+        deep_subs = sorted(confirmed_subs.keys(), key=lambda s: -confirmed_subs[s])[:5]
+        print(f"🔁 第二轮：在已验证版块深挖 ({', '.join('r/'+s for s in deep_subs)})...", flush=True)
+        existing_ids = {p['id'] for p in relevant}
+        new_posts = []
+        for sub in deep_subs:
+            for kw in keywords[:3]:
+                posts = search_reddit(kw, subreddit=sub, cookie_str=cookie_str,
+                                       timeframe="year", limit=25)
+                for p in posts:
+                    if p['id'] not in existing_ids:
+                        existing_ids.add(p['id']); new_posts.append(p)
+                time.sleep(0.8)
+        # filter_words 过滤
+        if filter_words:
+            new_posts = [p for p in new_posts
+                         if any(w.lower() in (p['title'] + ' ' + p['selftext']).lower() for w in filter_words)]
+        print(f"   第二轮新增: {len(new_posts)} 帖（已去重）")
+
+        # 第二轮也复核一下
+        if new_posts:
+            print("🧐 Haiku 复核第二轮...", flush=True)
+            new_relevant, new_details = filter_posts_by_relevance(new_posts, direction)
+            print(f"   复核后新增: {len(new_relevant)} 帖")
+            details.extend(new_details)
+            relevant.extend(new_relevant)
+
     if details:
-        # 打印淘汰的最有代表性的几个，便于诊断
         eliminated = [d for d in details if d[2] < 6][:5]
         if eliminated:
             print("   淘汰示例:")

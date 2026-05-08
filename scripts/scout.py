@@ -138,22 +138,26 @@ def fetch_posts_from_sub(sub, sort, timeframe, cookie_str, limit=None):
     """按版块抓取热帖"""
     if limit is None:
         limit = BROAD_POSTS_PER_SUB
-    url = f"https://www.reddit.com/r/{sub}/{sort}.json?limit={limit}"
+    sub_clean = sub.lstrip('/').lstrip('r/').lstrip('R/').strip('/')
+    url = f"https://www.reddit.com/r/{sub_clean}/{sort}.json?limit={limit}"
     if timeframe:
         url += f"&t={timeframe}"
     data = reddit_get(url, cookie_str)
-    if not data:
+    if not data or not isinstance(data, dict):
         return []
+    children = data.get('data', {}).get('children', []) if isinstance(data.get('data'), dict) else []
     posts = []
-    for item in data['data']['children']:
-        d = item['data']
+    for item in children:
+        d = item.get('data', {})
+        if not d.get('id'):
+            continue
         posts.append({
             'id': d['id'],
-            'title': d['title'],
-            'score': d['score'],
-            'num_comments': d['num_comments'],
-            'selftext': d['selftext'][:600] if d.get('selftext') else '',
-            'subreddit': sub,
+            'title': d.get('title', ''),
+            'score': d.get('score', 0),
+            'num_comments': d.get('num_comments', 0),
+            'selftext': (d.get('selftext') or '')[:600],
+            'subreddit': sub_clean,
             'created_utc': d.get('created_utc'),
         })
     return posts
@@ -163,22 +167,27 @@ def search_reddit(keyword, subreddit=None, cookie_str="", limit=TARGETED_POSTS_P
     """关键词搜索帖子，可限定 subreddit + 时间窗口（hour/day/week/month/year/all）"""
     q = urllib.parse.quote(keyword)
     if subreddit:
-        url = f"https://www.reddit.com/r/{subreddit}/search.json?q={q}&sort=top&t={timeframe}&limit={limit}&restrict_sr=1"
+        # 兼容 Claude 偶尔输出带 'r/' 或 '/r/' 前缀的 sub 名
+        sub_clean = subreddit.lstrip('/').lstrip('r/').lstrip('R/').strip('/')
+        url = f"https://www.reddit.com/r/{sub_clean}/search.json?q={q}&sort=top&t={timeframe}&limit={limit}&restrict_sr=1"
     else:
         url = f"https://www.reddit.com/search.json?q={q}&sort=top&t={timeframe}&limit={limit}"
     data = reddit_get(url, cookie_str)
-    if not data:
+    if not data or not isinstance(data, dict):
         return []
+    children = data.get('data', {}).get('children', []) if isinstance(data.get('data'), dict) else []
     posts = []
-    for item in data['data']['children']:
-        d = item['data']
+    for item in children:
+        d = item.get('data', {})
+        if not d.get('id'):
+            continue
         posts.append({
             'id': d['id'],
-            'title': d['title'],
-            'score': d['score'],
-            'num_comments': d['num_comments'],
-            'selftext': d['selftext'][:600] if d.get('selftext') else '',
-            'subreddit': d['subreddit'],
+            'title': d.get('title', ''),
+            'score': d.get('score', 0),
+            'num_comments': d.get('num_comments', 0),
+            'selftext': (d.get('selftext') or '')[:600],
+            'subreddit': d.get('subreddit', ''),
             'created_utc': d.get('created_utc'),
         })
     return posts
@@ -198,15 +207,39 @@ def fetch_comments(post_id, sub, cookie_str):
     return comments[:COMMENTS_PER_POST]
 
 
+def discover_subreddits_by_name(keyword, cookie_str, top_n=10):
+    """
+    用 Reddit 自带的 /subreddits/search 找版块名直接匹配的真相关 sub。
+    比从帖子聚合更准——返回的是按 sub 名/描述匹配的，不是被噪音帖污染的。
+    """
+    q = urllib.parse.quote(keyword)
+    url = f"https://www.reddit.com/subreddits/search.json?q={q}&limit={top_n*2}&sort=relevance"
+    data = reddit_get(url, cookie_str)
+    if not data or 'data' not in data:
+        return []
+    out = []
+    for item in data['data']['children']:
+        d = item['data']
+        # 过滤掉用户太少的死版块
+        if d.get('subscribers', 0) < 1000:
+            continue
+        out.append({
+            "subreddit": d.get('display_name'),
+            "subscribers": d.get('subscribers', 0),
+            "description": (d.get('public_description') or '')[:80],
+        })
+        if len(out) >= top_n:
+            break
+    return out
+
+
 def discover_relevant_subreddits(product, cookie_str, top_n=10):
     """
-    数据驱动的子版块发现：
-    - 用产品词在 Reddit 全站搜索 top-year 帖子
-    - 统计这些热帖来自哪些版块
-    - 过滤掉常见噪音版块（NFL/NBA/球迷/股票/政治等高曝光大水版）
-    - 返回出现频次最高的 top_n 个版块（带证据：N 帖、累计赞数）
+    数据驱动的子版块发现（双源合并）：
+    1. /subreddits/search：按版块名匹配（最准）
+    2. /search.json 全站搜索 → 聚合帖子来自的版块（覆盖广）
+    过滤噪音黑名单后取 top_n。
     """
-    # 已知的高曝光大水版黑名单：搜任何短词都可能误伤这些
     NOISE_SUBREDDITS = {
         'nba', 'nfl', 'soccer', 'baseball', 'hockey', 'mma', 'formula1',
         'politics', 'worldnews', 'news', 'AskReddit', 'funny', 'pics',
@@ -216,25 +249,54 @@ def discover_relevant_subreddits(product, cookie_str, top_n=10):
         'unpopularopinion', 'TwoXChromosomes', 'gaming', 'pcmasterrace',
         'movies', 'television', 'music', 'KpopFap', 'kpop', 'popheads',
         'taylorswift', 'beatles', 'leagueoflegends', 'DotA2',
+        'nosleep', 'TrueCrimeDiscussion', 'BORUpdates', 'TopCharacterTropes',
+        'MadeMeSmile', 'MapPorn', 'bald', 'cats', 'dogs', 'aww',
     }
     NOISE_LOWER = {s.lower() for s in NOISE_SUBREDDITS}
 
+    # Source 1: 版块名匹配
+    name_matches = discover_subreddits_by_name(product, cookie_str, top_n=8)
+
+    # Source 2: 全站帖子聚合
     q = urllib.parse.quote(product)
     url = f"https://www.reddit.com/search.json?q={q}&sort=top&t=year&limit=100"
     data = reddit_get(url, cookie_str)
-    if not data or 'data' not in data:
-        return []
     counts = {}
-    for item in data['data']['children']:
-        d = item['data']
-        sub = d.get('subreddit')
-        if not sub or sub.lower() in NOISE_LOWER:
+    if data and 'data' in data:
+        for item in data['data']['children']:
+            d = item['data']
+            sub = d.get('subreddit')
+            if not sub or sub.lower() in NOISE_LOWER:
+                continue
+            c = counts.setdefault(sub, {"posts": 0, "score": 0})
+            c["posts"] += 1
+            c["score"] += d.get('score', 0)
+
+    # 合并：name_matches 放最前（更准），然后是 post-aggregated 排前 N
+    seen = set()
+    out = []
+    for nm in name_matches:
+        sub = nm["subreddit"]
+        if not sub or sub.lower() in NOISE_LOWER or sub.lower() in seen:
             continue
-        c = counts.setdefault(sub, {"posts": 0, "score": 0})
-        c["posts"] += 1
-        c["score"] += d.get('score', 0)
+        seen.add(sub.lower())
+        out.append({
+            "subreddit": sub, "posts": "N/A",
+            "total_score": f"{nm['subscribers']:,} 订阅",
+            "source": "name-match",
+        })
     ranked = sorted(counts.items(), key=lambda kv: (kv[1]["posts"], kv[1]["score"]), reverse=True)
-    return [{"subreddit": s, "posts": v["posts"], "total_score": v["score"]} for s, v in ranked[:top_n]]
+    for sub, v in ranked:
+        if sub.lower() in seen:
+            continue
+        seen.add(sub.lower())
+        out.append({
+            "subreddit": sub, "posts": v["posts"],
+            "total_score": v["score"], "source": "post-aggregate",
+        })
+        if len(out) >= top_n:
+            break
+    return out[:top_n]
 
 
 def filter_posts_by_relevance(posts, product, model="claude-haiku-4-5-20251001"):
@@ -329,6 +391,7 @@ def plan_search(product, model, candidate_subs=None):
 
 要求：
 {sub_instruction}
+- subreddit 名**不要带 "r/" 前缀**（直接写 `camping`，不要 `r/camping`）
 - keywords：3-5 个英文搜索词，覆盖"问题/抱怨/推荐/购买建议"等角度
 - filter_words：2-3 个**简单英文单词**（非短语），用于过滤帖子相关性，如 ["wallet", "purse"]
 - 只返回 JSON，不要其他内容"""

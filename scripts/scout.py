@@ -452,23 +452,55 @@ def amazon_validate(direction, max_skus=10, max_review_brands=3):
     print(f"   📂 类目（Haiku 挑选）: {top_node['nodeLabelPath']} ({top_node.get('products', '?')} 商品)")
 
     # Step 2: 抓 Top SKU（用上个月数据）
+    # 关键：按"最具识别性的核心词"过滤标题，避免父类目下其他爆款（如门垫、储粮桶）混入
     last_month = (datetime.date.today().replace(day=1) - datetime.timedelta(days=1)).strftime("%Y%m")
+
+    # 选最具识别性的核心词作 keyword（产品方向最后一个非通用词，通常是产品类型本身）
+    # 例如 "pet water fountain" → "fountain"; "outdoor solar lantern" → "lantern"
+    if direction_core:
+        identifier_word = direction_core[-1]  # 最后一个核心词通常是产品类型
+    elif direction_words_all:
+        identifier_word = direction_words_all[-1]
+    else:
+        identifier_word = direction
+
     skus_resp = sellersprite_call("product_research", {
         "request": {
             "marketplace": "US",
             "nodeIdPath": top_node["nodeIdPath"],
             "nodeIdPathEqual": False,
+            "keyword": identifier_word,
+            "matchType": 2,  # 2: 模糊匹配
             "month": last_month,
             "minUnits": 50,
-            "size": max_skus,
+            "size": max_skus * 4,  # 拿很多，去重后取 Top
             "order": {"field": "total_units", "desc": True}
         }
     })
-    items = []
+    raw_items = []
     if skus_resp and isinstance(skus_resp.get("data"), dict):
-        items = skus_resp["data"].get("items", []) or []
-    items.sort(key=lambda x: x.get("units") or 0, reverse=True)
-    print(f"   🏆 Top {len(items)} SKU 抓到（{last_month} 月销数据）")
+        raw_items = skus_resp["data"].get("items", []) or []
+    # 客户端二次校验：标题必须含识别词
+    raw_items = [
+        it for it in raw_items
+        if identifier_word.lower() in (it.get("title") or "").lower()
+    ]
+    raw_items.sort(key=lambda x: x.get("units") or 0, reverse=True)
+
+    # 关键：按品牌去重，让 Top N 是 N 个**不同品牌**的产品
+    # （同一品牌多个 listing 会让头部看起来"分散"，实际还是一家）
+    items = []
+    seen_brands = set()
+    for it in raw_items:
+        brand = (it.get("brand") or "").strip().lower()
+        if brand and brand in seen_brands:
+            continue
+        if brand:
+            seen_brands.add(brand)
+        items.append(it)
+        if len(items) >= max_skus:
+            break
+    print(f"   🏆 Top {len(items)} SKU（{last_month} 月销，标题必含 '{identifier_word}'，每品牌只取销量最高款）")
 
     if not items:
         return {

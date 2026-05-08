@@ -222,6 +222,52 @@ def send_card(open_id, card_json):
         return False
 
 
+def generate_data_driven_reason(direction, amazon_info, reddit_stats, model="claude-haiku-4-5-20251001"):
+    """
+    基于真实数据生成专业选题理由（用 Haiku 快速生成）。
+    优于 pick_fresh_direction 给的"避开 X 品类"机械理由。
+    """
+    amz_block = ""
+    if amazon_info:
+        kw = amazon_info.get("keyword_market", [])
+        kw_text = " | ".join(
+            f"'{k['keyword']}': 月搜{k.get('monthly_searches','?')}, 增长{k.get('growth_pct','?')}%, 供需比{k.get('supply_demand_ratio','?')}, 均价${k.get('avg_price','?')}"
+            for k in kw[:2]
+        )
+        top_brands = list({s.get("brand") for s in amazon_info.get("top_skus", [])[:5] if s.get("brand")})
+        top_units = sum((s.get("units_monthly") or 0) for s in amazon_info.get("top_skus", [])[:3])
+        amz_block = f"""
+- Amazon 类目: {amazon_info.get('category','?').split(':')[-1]}（{amazon_info.get('category_products_total','?')} 商品）
+- 关键词数据: {kw_text}
+- Top 3 品牌月销合计: {top_units:,} 单
+- 头部品牌: {', '.join(top_brands[:5])}"""
+
+    reddit_block = f"""
+- Reddit 讨论: {reddit_stats.get('subreddits','?')} 个版块, {reddit_stats.get('posts',0)} 帖, {reddit_stats.get('comments',0)} 评"""
+
+    prompt = f"""你是一名跨境电商选品分析师。请基于下面的真实数据，**用 1-2 句话**说明今天为什么选「{direction}」这个产品方向值得做深度分析。
+
+要求：
+- **必须引用具体数据**（搜索量/增长率/月销量/讨论量等数字）
+- 从市场规模、增长趋势、竞争格局、需求强度其中 1-2 个角度切入
+- 不要说"避开 X 品类"这种轮换理由
+- 不要说"季节合适"这种宽泛理由
+- 用专业、克制的笔调，不要鸡汤
+- 中文 60-100 字
+
+数据：{amz_block}{reddit_block}
+
+直接给理由文本，不要前缀（不要"理由："）。"""
+    try:
+        resp = client.messages.create(
+            model=model, max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        return f"（数据驱动理由生成失败：{e}）"
+
+
 def run_targeted_inline(direction, model):
     """内联跑定向模式（便于 daily 控制流）"""
     cookie_str = get_cookies()
@@ -416,7 +462,17 @@ def main():
         print("⚠️  报告里没有 BITABLE_DATA，跳过卡片发送", flush=True)
         sys.exit(2)
 
-    card = build_card(structured["opportunities"][0], direction, reason, doc_url, bitable_url, scan, amazon_info)
+    # 用真实数据生成专业选题理由（覆盖 pick 阶段的初步理由）
+    print("📝 生成数据驱动选题理由...", flush=True)
+    data_reason = generate_data_driven_reason(
+        direction, amazon_info,
+        {"subreddits": len(scan.get("subreddits", [])) if isinstance(scan.get("subreddits"), list) else "?",
+         "posts": scan["posts_scanned"],
+         "comments": scan["comments_analyzed"]}
+    )
+    print(f"   {data_reason}", flush=True)
+
+    card = build_card(structured["opportunities"][0], direction, data_reason, doc_url, bitable_url, scan, amazon_info)
     success = send_card(DAILY_RECIPIENT_OPEN_ID, card)
     print(f"💬 私信卡片发送：{'✅' if success else '❌'}", flush=True)
     print(f"\n🎉 完成（{datetime.datetime.now().isoformat()}）", flush=True)

@@ -196,9 +196,54 @@ def fetch_comments(post_id, sub, cookie_str):
     return comments[:COMMENTS_PER_POST]
 
 
-def plan_search(product, model):
-    """定向模式 Step 1：让 Claude 规划搜索策略"""
+def discover_relevant_subreddits(product, cookie_str, top_n=10):
+    """
+    数据驱动的子版块发现：
+    - 用产品词在 Reddit 全站搜索 top-year 帖子
+    - 统计这些热帖来自哪些版块
+    - 返回出现频次最高的 top_n 个版块（带证据：N 帖、累计赞数）
+    """
+    q = urllib.parse.quote(product)
+    url = f"https://www.reddit.com/search.json?q={q}&sort=top&t=year&limit=100"
+    data = reddit_get(url, cookie_str)
+    if not data or 'data' not in data:
+        return []
+    counts = {}  # subreddit -> {posts, total_score}
+    for item in data['data']['children']:
+        d = item['data']
+        sub = d.get('subreddit')
+        if not sub:
+            continue
+        c = counts.setdefault(sub, {"posts": 0, "score": 0})
+        c["posts"] += 1
+        c["score"] += d.get('score', 0)
+    ranked = sorted(counts.items(), key=lambda kv: (kv[1]["posts"], kv[1]["score"]), reverse=True)
+    return [{"subreddit": s, "posts": v["posts"], "total_score": v["score"]} for s, v in ranked[:top_n]]
+
+
+def plan_search(product, model, candidate_subs=None):
+    """
+    定向模式 Step 1：让 Claude 规划搜索策略
+    candidate_subs: 来自 discover_relevant_subreddits 的数据驱动候选列表（强制 Claude 在里面选）
+    """
     print(f"\n🧠 规划搜索策略（产品：{product}）...\n")
+
+    if candidate_subs:
+        cand_lines = "\n".join(
+            f"- r/{c['subreddit']}（{c['posts']} 帖 / {c['total_score']} 累计赞）"
+            for c in candidate_subs
+        )
+        sub_instruction = f"""**候选 subreddit 列表**（基于 Reddit 真实搜索数据，按相关性降序）：
+{cand_lines}
+
+**严格要求**：
+- subreddits 字段**必须从上面列表中选 3-5 个**，按真实买家讨论密度判断
+- 排除明显不相关的（比如产品名是 "picnic blanket" 时，r/pickling 这种字面巧合的不要）
+- 不要凭印象添加未在候选列表中的版块"""
+    else:
+        sub_instruction = """- subreddits：3-5 个，选择最可能有该产品**真实买家**讨论的版块（英文，不带 r/）
+- 不要选男性时尚版块给女性产品；避免字面巧合（picnic vs pickling）"""
+
     prompt = f"""你是一名跨境电商选品研究员，正在研究「{product}」这个产品品类在 Reddit 上的买家讨论。
 
 请给出搜索策略，返回 JSON 格式：
@@ -210,7 +255,7 @@ def plan_search(product, model):
 }}
 
 要求：
-- subreddits：3-5 个，选择最可能有该产品**真实买家**讨论的版块（英文，不带 r/），不要选男性时尚版块给女性产品
+{sub_instruction}
 - keywords：3-5 个英文搜索词，覆盖"问题/抱怨/推荐/购买建议"等角度
 - filter_words：2-3 个**简单英文单词**（非短语），用于过滤帖子相关性，如 ["wallet", "purse"]
 - 只返回 JSON，不要其他内容"""
@@ -725,7 +770,17 @@ def run_targeted_mode(cookie_str, args):
     product = args.product
     print(f"🎯 目标产品：{product}")
 
-    plan = plan_search(product, args.model)
+    # 数据驱动：先用 Reddit 自带搜索找出真实有讨论的候选版块
+    print("🔎 数据驱动发现候选版块...", flush=True)
+    candidates = discover_relevant_subreddits(product, cookie_str)
+    if candidates:
+        print(f"   候选 {len(candidates)} 个版块（按真实帖数排）：")
+        for c in candidates[:8]:
+            print(f"   · r/{c['subreddit']} ({c['posts']} 帖 / {c['total_score']} 赞)")
+    else:
+        print("   ⚠️  未找到候选版块，回退到 Claude 自由选择")
+
+    plan = plan_search(product, args.model, candidate_subs=candidates)
     subreddits = plan.get("subreddits", [])
     keywords = plan.get("keywords", [])
     filter_words = plan.get("filter_words", [])

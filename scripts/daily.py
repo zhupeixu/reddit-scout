@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from scout import (
     load_bitable_config, get_cookies, plan_search, search_reddit,
     fetch_comments, save_report, create_feishu_doc, push_to_bitable,
-    extract_bitable_data, analyze_targeted,
+    extract_bitable_data, analyze_targeted, discover_relevant_subreddits,
     MAX_POSTS_FOR_ANALYSIS, DEFAULT_MODEL,
 )
 
@@ -181,7 +181,18 @@ def send_card(open_id, card_json):
 def run_targeted_inline(direction, model):
     """内联跑定向模式（便于 daily 控制流）"""
     cookie_str = get_cookies()
-    plan = plan_search(direction, model)
+
+    # 数据驱动：先用 Reddit 自身搜索找候选版块
+    print("🔎 数据驱动发现候选版块...", flush=True)
+    candidates = discover_relevant_subreddits(direction, cookie_str)
+    if candidates:
+        print(f"   候选 {len(candidates)} 个版块（按真实帖数）：")
+        for c in candidates[:8]:
+            print(f"   · r/{c['subreddit']} ({c['posts']} 帖 / {c['total_score']} 赞)")
+    else:
+        print("   ⚠️  未找到候选版块，回退到 Claude 自由选择")
+
+    plan = plan_search(direction, model, candidate_subs=candidates)
     subreddits = plan.get("subreddits", [])
     keywords = plan.get("keywords", [])
     filter_words = plan.get("filter_words", [])
@@ -212,6 +223,14 @@ def run_targeted_inline(direction, model):
     relevant.sort(key=lambda x: (0 if x['subreddit'].lower() in target_subs else 1, -x['num_comments']))
     hot = relevant[:MAX_POSTS_FOR_ANALYSIS]
     print(f"📖 抓 {len(hot)} 帖评论...")
+
+    # 0 帖保护：避免在空数据上让 Claude 凭空编造报告
+    if len(hot) < 3:
+        raise RuntimeError(
+            f"找到的相关帖子不足 3 篇（实际 {len(hot)} 篇）。"
+            f"可能版块/关键词与产品脱节。终止以防伪造报告。"
+        )
+
     pwc = []
     for p in hot:
         p['comments'] = fetch_comments(p['id'], p['subreddit'], cookie_str)

@@ -30,6 +30,9 @@ DEFAULT_BITABLE = {
 
 SELLERSPRITE_MCP_URL = "https://mcp.sellersprite.com/mcp"
 
+# 用于覆盖 Metana 代理对 Haiku 的"Kiro 代码助手"persona 注入
+HAIKU_SYSTEM = "你是跨境电商选品分析助手，严格按用户指定的格式和语言输出，不要解释身份或拒绝任务。"
+
 # ── 默认配置 ────────────────────────────────────────────────────
 DEFAULT_MODEL = "claude-sonnet-4-6"
 COMMENTS_PER_POST = 30
@@ -66,7 +69,9 @@ WEEKLY_TOP_POSTS = 30
 TARGETED_POSTS_PER_SEARCH = 10
 # ─────────────────────────────────────────────────────────────────
 
-client = anthropic.Anthropic()
+client = anthropic.Anthropic(
+    auth_token=os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"),
+)
 
 
 def load_bitable_config():
@@ -434,8 +439,9 @@ def amazon_validate(direction, max_skus=10, max_review_brands=3):
 只返回 1 个数字（候选序号 1-{len(candidates_top)}，或 0 表示都不匹配）。不要任何其他文字。"""
     try:
         pick_resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-6",
             max_tokens=10,
+            system=HAIKU_SYSTEM,
             messages=[{"role": "user", "content": pick_prompt}]
         )
         pick_idx = int(pick_resp.content[0].text.strip()) - 1
@@ -654,7 +660,7 @@ def format_amazon_section_for_prompt(amazon_data):
 
 # ── Reddit 帖子相关度过滤（Haiku） ─────────────────────────────
 
-def filter_posts_by_relevance(posts, product, model="claude-haiku-4-5-20251001"):
+def filter_posts_by_relevance(posts, product, model="claude-sonnet-4-6"):
     """
     用 Haiku 给每帖打相关度分，去掉与产品无关的噪音。
     返回 (相关帖列表, 评分明细) — 用 ≥ 7 分作为阈值（更严，避免松鼠视频这种边缘命中混入）。
@@ -694,6 +700,7 @@ def filter_posts_by_relevance(posts, product, model="claude-haiku-4-5-20251001")
     try:
         resp = client.messages.create(
             model=model, max_tokens=1500,
+            system=HAIKU_SYSTEM,
             messages=[{"role": "user", "content": prompt}]
         )
         lines = resp.content[0].text.strip().split("\n")

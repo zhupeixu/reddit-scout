@@ -19,7 +19,7 @@ from scout import (
     load_bitable_config, get_cookies, plan_search, search_reddit,
     fetch_comments, save_report, create_feishu_doc, push_to_bitable,
     extract_bitable_data, analyze_targeted, discover_relevant_subreddits,
-    filter_posts_by_relevance, amazon_validate,
+    filter_posts_by_relevance, amazon_validate, reddit_get,
     MAX_POSTS_FOR_ANALYSIS, DEFAULT_MODEL,
 )
 
@@ -31,7 +31,9 @@ DAYS_LOOKBACK = 60
 MODEL = DEFAULT_MODEL
 # ─────────────────────────────────────────────────────────
 
-client = anthropic.Anthropic()
+client = anthropic.Anthropic(
+    auth_token=os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"),
+)
 
 
 def get_recent_products(days=DAYS_LOOKBACK):
@@ -222,7 +224,191 @@ def send_card(open_id, card_json):
         return False
 
 
-def generate_data_driven_reason(direction, amazon_info, reddit_stats, model="claude-haiku-4-5-20251001"):
+# ── Reddit 主导的双阶段选题 ─────────────────────────────
+
+# 12 个跨品类的"买家信号版块"——每个品类挑 1 个真实买家讨论密集的版块
+SIGNAL_SUBREDDITS = [
+    "BuyItForLife",   # 综合：耐用品讨论
+    "Frugal",         # 综合：性价比/推荐
+    "ShouldIBuyThis", # 综合：购买咨询
+    "Cooking",        # 厨房
+    "HomeImprovement",# 家居
+    "Parenting",      # 育儿
+    "pets",           # 宠物
+    "Fitness",        # 健身
+    "SkincareAddiction", # 个护
+    "malelivingspace",# 男性家居
+    "femalefashionadvice", # 女性服饰
+    "DIY",            # 工具/DIY
+]
+
+
+def discover_reddit_candidates(seen_products, cookie_str, n_candidates=10, model="claude-sonnet-4-6"):
+    """
+    从 Reddit 信号版块抓近 7 天热帖 → Haiku 提取候选产品方向（去重历史）
+    返回候选列表，每个含: direction / category / source_posts / signal_count
+    """
+    print("📡 扫信号版块（近 7 天）...", flush=True)
+    all_posts = []
+    for sub in SIGNAL_SUBREDDITS:
+        posts = reddit_get(
+            f"https://www.reddit.com/r/{sub}/top.json?t=week&limit=15",
+            cookie_str
+        )
+        if posts and isinstance(posts, dict):
+            for item in posts.get('data', {}).get('children', []):
+                d = item.get('data', {})
+                if d.get('id'):
+                    all_posts.append({
+                        "subreddit": sub,
+                        "title": d.get('title', ''),
+                        "selftext": (d.get('selftext') or '')[:200],
+                        "score": d.get('score', 0),
+                        "num_comments": d.get('num_comments', 0),
+                    })
+        time.sleep(0.4)
+    print(f"   抓到 {len(all_posts)} 条原始信号", flush=True)
+
+    if not all_posts:
+        return []
+
+    # Haiku 抽取候选产品方向
+    posts_block = "\n".join(
+        f"{i+1}. r/{p['subreddit']} ({p['score']}赞/{p['num_comments']}评) {p['title'][:120]}"
+        + (f" | {p['selftext'][:80]}" if p['selftext'] else "")
+        for i, p in enumerate(all_posts[:120])  # 限制 token
+    )
+    seen_block = "\n".join(f"- {n}" for n in seen_products[:30]) if seen_products else "（无历史）"
+
+    prompt = f"""你是跨境电商选品分析师。下面是 Reddit 12 个买家信号版块近 7 天的热帖。
+
+请从中**抽取 {n_candidates} 个具体可制造的产品方向**——必须是实物 SKU（不是软件/服务/食品/宠物本身），且**不能与下面已分析过的方向重复或近似**。
+
+【已分析过的方向（避重）】
+{seen_block}
+
+【抽取规则】
+- 优先含明确购买/咨询/抱怨/求推荐信号的帖子（"recommend"/"wish there was"/"problem with"/"best for"）
+- 跨品类：12 个里要至少覆盖 6 个不同品类（厨房/家居/宠物/育儿/健身/个护/服饰/办公/汽车/工具/园艺/户外）
+- 用 1-3 个英文词描述（便于后续 Reddit 搜索）
+
+【输出格式】严格按格式输出 {n_candidates} 行，每行 1 个候选：
+`英文产品方向|中文品类|参考帖序号(如 3,17,42)|为什么这是机会(中文 ≤25 字)`
+
+例：
+cat litter mat|宠物|5,12|高赞抱怨现有产品太薄
+standing desk converter|办公|8,33|多人求推荐升降桌方案
+
+只输出 {n_candidates} 行，不要其他内容。
+
+【近 7 天热帖】
+{posts_block[:18000]}"""
+
+    try:
+        resp = client.messages.create(
+            model=model, max_tokens=2000,
+            system="你是跨境电商选品分析助手，严格按用户指定的格式和语言输出，不要解释身份或拒绝任务。",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        lines = resp.content[0].text.strip().split("\n")
+    except Exception as e:
+        print(f"⚠️  Haiku 抽取失败: {e}")
+        return []
+
+    candidates = []
+    import re as _re
+    for ln in lines:
+        # 去掉行首的 "N. " 或 "N、" 等编号前缀
+        clean = _re.sub(r'^\s*\d+[\.\)、]\s*', '', ln.strip())
+        # 必须是 4 段 | 分隔的格式
+        parts = [p.strip() for p in clean.split("|")]
+        if len(parts) < 4:
+            continue
+        # 第一段必须含英文（产品方向）
+        if not _re.search(r'[a-zA-Z]', parts[0]):
+            continue
+        try:
+            refs = [int(x.strip()) - 1 for x in parts[2].split(",") if x.strip().isdigit()]
+            source_posts = [all_posts[i] for i in refs if 0 <= i < len(all_posts)]
+            candidates.append({
+                "direction": parts[0],
+                "category": parts[1],
+                "hint": parts[3],
+                "source_posts": source_posts,
+            })
+        except (ValueError, IndexError):
+            continue
+    print(f"   Haiku 抽出 {len(candidates)} 个候选", flush=True)
+    return candidates
+
+
+def score_reddit_candidate(candidate, cookie_str):
+    """
+    给一个候选打分：
+    - 近 30 天 Reddit search 帖数
+    - 累计赞 / 累计评论
+    - 含买家信号词的帖子比例（recommend/wish/problem/frustrated/looking for）
+    """
+    direction = candidate["direction"]
+    posts = search_reddit(direction, cookie_str=cookie_str, limit=30, timeframe="month")
+    if not posts:
+        return 0, {"posts_30d": 0, "total_score": 0, "total_comments": 0, "buyer_signal_pct": 0}
+
+    BUYER_SIGNALS = ["recommend", "wish there", "best for", "looking for",
+                      "problem with", "frustrated", "issue with", "anyone tried",
+                      "should i buy", "vs", "or", "review"]
+    total_score = sum(p.get('score', 0) for p in posts)
+    total_comments = sum(p.get('num_comments', 0) for p in posts)
+    buyer_signal = sum(
+        1 for p in posts
+        if any(sig in (p.get('title', '') + ' ' + p.get('selftext', '')).lower()
+               for sig in BUYER_SIGNALS)
+    )
+    pct = buyer_signal / max(len(posts), 1)
+
+    # 综合分：log(帖数) × log(累计赞) × (1 + 买家信号比例)
+    import math
+    score = (
+        math.log(max(len(posts), 1) + 1) * 30
+        + math.log(max(total_score, 1) + 1) * 5
+        + math.log(max(total_comments, 1) + 1) * 3
+        + pct * 50
+    )
+    return round(score, 1), {
+        "posts_30d": len(posts),
+        "total_score": total_score,
+        "total_comments": total_comments,
+        "buyer_signal_pct": round(pct * 100, 1),
+    }
+
+
+def reddit_driven_pick(seen_products, last_5_names, cookie_str):
+    """
+    Reddit 主导的双阶段选题：
+    1. 候选生成（扫信号版块 + Haiku 抽取）
+    2. 每个候选打分（近 30 天讨论密度 + 买家信号）
+    3. 返回 Top 1 + 全部排名（用作"为什么是它"的事前依据）
+    """
+    candidates = discover_reddit_candidates(seen_products, cookie_str, n_candidates=10)
+    if not candidates:
+        return None, []
+
+    print("📊 候选打分（近 30 天 Reddit 讨论密度）...", flush=True)
+    ranked = []
+    for c in candidates:
+        score, stats = score_reddit_candidate(c, cookie_str)
+        c["score"] = score
+        c["stats"] = stats
+        ranked.append(c)
+        print(f"   · {c['direction']:<35} 分 {score:>6.1f}  | {stats['posts_30d']:>3} 帖, {stats['total_score']:>6} 赞, 信号词 {stats['buyer_signal_pct']}%")
+        time.sleep(0.3)
+
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+    print(f"\n🥇 Top 候选：{ranked[0]['direction']}（{ranked[0]['category']}，分 {ranked[0]['score']}）", flush=True)
+    return ranked[0], ranked
+
+
+def generate_data_driven_reason(direction, amazon_info, reddit_stats, ranked_candidates=None, model="claude-sonnet-4-6"):
     """
     基于真实数据生成专业选题理由（用 Haiku 快速生成）。
     优于 pick_fresh_direction 给的"避开 X 品类"机械理由。
@@ -245,22 +431,37 @@ def generate_data_driven_reason(direction, amazon_info, reddit_stats, model="cla
     reddit_block = f"""
 - Reddit 讨论: {reddit_stats.get('subreddits','?')} 个版块, {reddit_stats.get('posts',0)} 帖, {reddit_stats.get('comments',0)} 评"""
 
-    prompt = f"""你是一名跨境电商选品分析师。请基于下面的真实数据，**用 1-2 句话**说明今天为什么选「{direction}」这个产品方向值得做深度分析。
+    # 加候选排名上下文：让 Claude 真正说"为什么是它而不是别的候选"
+    rank_block = ""
+    if ranked_candidates:
+        top1 = ranked_candidates[0]
+        rest = ranked_candidates[1:4]
+        rest_text = "\n".join(
+            f"  · {c['direction']} (分 {c.get('score', '?')}, {c.get('stats',{}).get('posts_30d','?')} 帖)"
+            for c in rest
+        )
+        rank_block = f"""
+- 选题来自 {len(ranked_candidates)} 个候选的数据排名:
+  Top 1: {top1['direction']} (综合分 {top1.get('score','?')}, 近30天 {top1.get('stats',{}).get('posts_30d','?')} 帖, 累计 {top1.get('stats',{}).get('total_score','?')} 赞, 含买家信号词 {top1.get('stats',{}).get('buyer_signal_pct','?')}%)
+  其他候选:
+{rest_text}"""
+
+    prompt = f"""你是一名跨境电商选品分析师。请基于下面的真实数据，**用 2-3 句话**说明为什么选「{direction}」这个产品方向。
 
 要求：
-- **必须引用具体数据**（搜索量/增长率/月销量/讨论量等数字）
-- 从市场规模、增长趋势、竞争格局、需求强度其中 1-2 个角度切入
-- 不要说"避开 X 品类"这种轮换理由
-- 不要说"季节合适"这种宽泛理由
-- 用专业、克制的笔调，不要鸡汤
-- 中文 60-100 字
+- **必须引用具体数据**（候选排名 / 帖数 / 赞数 / 买家信号比例 / Amazon 月销 / 增长率等）
+- **如果有"候选排名"数据，必须解释"为什么是它而不是其他候选"**（这是真正的事前依据）
+- 不要说"避开 X 品类"或"季节合适"
+- 专业克制，不鸡汤
+- 中文 80-130 字
 
-数据：{amz_block}{reddit_block}
+数据：{rank_block}{amz_block}{reddit_block}
 
-直接给理由文本，不要前缀（不要"理由："）。"""
+直接给理由文本，不要前缀。"""
     try:
         resp = client.messages.create(
-            model=model, max_tokens=300,
+            model=model, max_tokens=400,
+            system="你是跨境电商选品分析助手，严格按用户指定的格式和语言输出，不要解释身份或拒绝任务。",
             messages=[{"role": "user", "content": prompt}]
         )
         return resp.content[0].text.strip()
@@ -416,19 +617,32 @@ def main():
     names, dirs, last_5 = get_recent_products()
     print(f"   过去 {DAYS_LOOKBACK} 天已分析：{len(names)} 个产品 / {len(set(dirs))} 次运行", flush=True)
 
-    print("🧠 选择今日新方向...", flush=True)
-    # 重试机制：当 Reddit 数据不足触发 RuntimeError 时，自动换方向（最多 3 次）
+    print("🎯 Reddit 主导的双阶段选题...", flush=True)
+    cookie_str = get_cookies()
+
+    # 重试：选 Top 1 → 跑深度分析；失败则取候选 Top 2/3...
     MAX_RETRIES = 3
     failed_directions = []
+    ranked_candidates = None
+
+    # Stage 1+2：候选生成 + 打分（只跑一次，候选列表全程复用）
+    seen = names + failed_directions
+    top_pick, ranked_candidates = reddit_driven_pick(seen, last_5, cookie_str)
+    if not top_pick:
+        print("❌ 无法生成候选方向，终止", flush=True)
+        sys.exit(1)
+
     for attempt in range(MAX_RETRIES):
-        # 把已失败方向也加到避重列表，避免再选
-        pick = pick_fresh_direction(names + failed_directions, dirs + failed_directions, last_5_names=last_5)
+        if attempt < len(ranked_candidates):
+            pick = ranked_candidates[attempt]
+        else:
+            print(f"❌ 候选耗尽（{len(ranked_candidates)} 个全失败），终止", flush=True)
+            sys.exit(1)
         direction = pick["direction"]
         category = pick.get("category", "?")
-        reason = pick.get("reason_cn", "")
         if attempt > 0:
-            print(f"\n🔄 第 {attempt+1} 次尝试", flush=True)
-        print(f"🎯 今日选定：{direction}（{category}）\n   {reason}", flush=True)
+            print(f"\n🔄 第 {attempt+1} 次尝试（候选 #{attempt+1}）", flush=True)
+        print(f"📦 进入深度分析：{direction}（{category}，候选分 {pick.get('score','?')}）", flush=True)
         try:
             report, pwc, subreddits, amazon_info = run_targeted_inline(direction, MODEL)
             break
@@ -462,13 +676,14 @@ def main():
         print("⚠️  报告里没有 BITABLE_DATA，跳过卡片发送", flush=True)
         sys.exit(2)
 
-    # 用真实数据生成专业选题理由（覆盖 pick 阶段的初步理由）
+    # 用真实数据生成专业选题理由（含候选排名上下文）
     print("📝 生成数据驱动选题理由...", flush=True)
     data_reason = generate_data_driven_reason(
         direction, amazon_info,
         {"subreddits": len(scan.get("subreddits", [])) if isinstance(scan.get("subreddits"), list) else "?",
          "posts": scan["posts_scanned"],
-         "comments": scan["comments_analyzed"]}
+         "comments": scan["comments_analyzed"]},
+        ranked_candidates=ranked_candidates,
     )
     print(f"   {data_reason}", flush=True)
 

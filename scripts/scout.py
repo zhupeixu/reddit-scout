@@ -416,9 +416,30 @@ def amazon_validate(direction, max_skus=10, max_review_brands=3):
     filtered = [n for n in candidates if 200 <= (n.get("products") or 0) <= 50000]
     if not filtered:
         filtered = candidates
-    # 取 top 25 候选给 Haiku 选
+    # 候选排序：双轨策略 —— 既要看到叶子,又要看到大类
+    # 旧逻辑只按商品数倒排取 top 25,会把"叶子精准类目"(如 522 SKU 的 Overalls & Coveralls)排到后面被切掉,
+    # 让 Sonnet 只能在父级里挑,导致类目过宽 + Top SKU 过滤后所剩无几。
+    # 新逻辑:先按规模排,再把"路径最深 + 路径里含产品核心词"的叶子节点强制提到候选池。
     filtered.sort(key=lambda x: x.get("products", 0), reverse=True)
-    candidates_top = filtered[:25]
+    by_size = filtered[:25]
+    # 找叶子(路径最深的若干个) + 路径里强匹配核心词的节点
+    leaf_priority = sorted(
+        filtered,
+        key=lambda x: (
+            -len(x.get("nodeLabelPath", "").split(":")),  # 路径越深越靠前
+            -sum(1 for w in direction_core if w in (x.get("nodeLabelPath") or "").lower()),  # 含核心词越多越靠前
+        )
+    )[:15]
+    # 合并去重(by_size 优先保留),最多 35 个候选
+    seen_paths = set()
+    candidates_top = []
+    for n in by_size + leaf_priority:
+        p = n.get("nodeIdPath")
+        if p and p not in seen_paths:
+            seen_paths.add(p)
+            candidates_top.append(n)
+            if len(candidates_top) >= 35:
+                break
 
     # 步骤 2：让 Haiku 看候选挑最匹配的
     cand_lines = "\n".join(
@@ -427,11 +448,13 @@ def amazon_validate(direction, max_skus=10, max_review_brands=3):
     )
     pick_prompt = f"""从以下亚马逊类目候选中，选出最适合分析「{direction}」这个产品的类目。
 
-判断标准：
-- **类目语义必须真的就是这个产品**（如 portable hammock stand 应选含 hammock 的类目，不是站立桨板 Stand-Up Paddleboarding 这种字面巧合）
-- 优先选**叶子层级深、语义精准**的类目，而不是含混大类目
-- 商品数量在 500-15000 之间最理想；过大数据多杂噪音，过小数据稀疏
-- 如果**没有真正匹配**的类目（产品在亚马逊还是新品类），返回 0
+判断标准（按优先级）：
+1. **类目语义必须就是这个产品本身**（如 portable hammock stand 应选含 hammock 的类目，不是 Stand-Up Paddleboarding 字面巧合）
+2. **如果父类目和叶子类目都匹配，必选叶子**（路径最深的那个）—— 父类目会混入大量无关 SKU，污染头部销量分析
+   例：work overalls 选「Overalls & Coveralls」(522) 而不是它的父级「Work Utility & Safety」(1919)
+   例：solar lantern 选「Outdoor Solar Lights」叶子而不是「Outdoor Lighting」父级
+3. 商品数量 200-15000 之间最理想；过大数据杂噪，过小稀疏
+4. 如果**没有真正匹配**的类目，返回 0
 
 候选：
 {cand_lines}
@@ -458,17 +481,42 @@ def amazon_validate(direction, max_skus=10, max_review_brands=3):
     print(f"   📂 类目（Haiku 挑选）: {top_node['nodeLabelPath']} ({top_node.get('products', '?')} 商品)")
 
     # Step 2: 抓 Top SKU（用上个月数据）
-    # 关键：按"最具识别性的核心词"过滤标题，避免父类目下其他爆款（如门垫、储粮桶）混入
+    # 关键：按"产品类型词"过滤标题，避免父类目下其他爆款（如门垫、储粮桶）混入
     last_month = (datetime.date.today().replace(day=1) - datetime.timedelta(days=1)).strftime("%Y%m")
 
-    # 选最具识别性的核心词作 keyword（产品方向最后一个非通用词，通常是产品类型本身）
-    # 例如 "pet water fountain" → "fountain"; "outdoor solar lantern" → "lantern"
-    if direction_core:
-        identifier_word = direction_core[-1]  # 最后一个核心词通常是产品类型
-    elif direction_words_all:
-        identifier_word = direction_words_all[-1]
-    else:
-        identifier_word = direction
+    # identifier_word：用 Sonnet 抽产品类型词，不再用启发式取最后一个非通用词
+    # 启发式失败案例：
+    #   "work overalls for DIY" → 取 "diy"（用法词）❌，应该 "overalls"
+    #   "pet food allergy tracker tag" → 取 "tag"（载体）⚠️，更好是 "tracker"
+    extract_prompt = f"""产品方向："{direction}"
+
+提取一个**最能代表这个产品本身的英文小写单词**，用来在亚马逊搜索结果里识别"是不是这个产品"。
+
+规则：
+- 选**产品类型词**，不是用法/场景/材质（DIY/outdoor/solar 都不是产品类型）
+- 选**单数原型**（overalls→overall, blocks→block）以便子串匹配
+- 如果方向是 "X kit/X set" 这种通用容器词，挑前面更具体的词（"electrical safety kit" → "safety" 比 "kit" 好；"building blocks set" → "block" 比 "set" 好）
+- 只输出一个英文单词，全小写，不加引号、不加解释。"""
+    try:
+        ext_resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=10,
+            system=HAIKU_SYSTEM,
+            messages=[{"role": "user", "content": extract_prompt}]
+        )
+        identifier_word = ext_resp.content[0].text.strip().strip('"\'').split()[0].lower()
+        # 兜底防御：抽出来不能太短/含通用词
+        if len(identifier_word) < 3 or identifier_word in {"the", "and", "for", "kit", "set"}:
+            raise ValueError(f"identifier 太弱: {identifier_word!r}")
+    except Exception as e:
+        # 回退老逻辑
+        if direction_core:
+            identifier_word = direction_core[-1]
+        elif direction_words_all:
+            identifier_word = direction_words_all[-1]
+        else:
+            identifier_word = direction
+        print(f"   ⚠️  Sonnet 抽词失败 ({e})，回退启发式: '{identifier_word}'")
 
     skus_resp = sellersprite_call("product_research", {
         "request": {
@@ -480,17 +528,29 @@ def amazon_validate(direction, max_skus=10, max_review_brands=3):
             "month": last_month,
             "minUnits": 50,
             "size": max_skus * 4,  # 拿很多，去重后取 Top
+            "variation": "Y",  # Y=exclude variants 关键!不加默认会把每个尺寸/颜色变体当独立 SKU 返回,导致一个 ASIN 占满 Top 列表
             "order": {"field": "total_units", "desc": True}
         }
     })
     raw_items = []
     if skus_resp and isinstance(skus_resp.get("data"), dict):
         raw_items = skus_resp["data"].get("items", []) or []
+    api_returned = len(raw_items)
     # 客户端二次校验：标题必须含识别词
     raw_items = [
         it for it in raw_items
         if identifier_word.lower() in (it.get("title") or "").lower()
     ]
+
+    # 兜底：标题过滤掏空了，但 API 返回了东西 → 类目已经够窄，直接用 API 结果
+    # （Sonnet 可能抽了个不常出现在标题里的词，但叶子类目本身能保证相关性）
+    if not raw_items and api_returned > 0:
+        raw_items = skus_resp["data"]["items"]
+        print(f"   ⚠️  '{identifier_word}' 标题过滤后为空，回退到类目原始 Top（共 {api_returned} 个）")
+        used_filter_note = f"未严格过滤标题（识别词 '{identifier_word}' 在标题中罕见），按类目销量排序"
+    else:
+        used_filter_note = f"标题必含 '{identifier_word}'"
+
     raw_items.sort(key=lambda x: x.get("units") or 0, reverse=True)
 
     # 关键：按品牌去重，让 Top N 是 N 个**不同品牌**的产品
@@ -506,7 +566,7 @@ def amazon_validate(direction, max_skus=10, max_review_brands=3):
         items.append(it)
         if len(items) >= max_skus:
             break
-    print(f"   🏆 Top {len(items)} SKU（{last_month} 月销，标题必含 '{identifier_word}'，每品牌只取销量最高款）")
+    print(f"   🏆 Top {len(items)} SKU（{last_month} 月销，{used_filter_note}，每品牌只取销量最高款）")
 
     if not items:
         return {

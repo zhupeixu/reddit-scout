@@ -12,6 +12,7 @@
 适合 launchd / cron 每日定时调用。
 """
 import json, subprocess, time, datetime, os, sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import anthropic
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -248,25 +249,32 @@ def discover_reddit_candidates(seen_products, cookie_str, n_candidates=10, model
     从 Reddit 信号版块抓近 7 天热帖 → Haiku 提取候选产品方向（去重历史）
     返回候选列表，每个含: direction / category / source_posts / signal_count
     """
-    print("📡 扫信号版块（近 7 天）...", flush=True)
+    print("📡 扫信号版块（近 7 天，并行）...", flush=True)
     all_posts = []
-    for sub in SIGNAL_SUBREDDITS:
+
+    def _fetch_sub(sub):
         posts = reddit_get(
             f"https://www.reddit.com/r/{sub}/top.json?t=week&limit=15",
             cookie_str
         )
+        out = []
         if posts and isinstance(posts, dict):
             for item in posts.get('data', {}).get('children', []):
                 d = item.get('data', {})
                 if d.get('id'):
-                    all_posts.append({
+                    out.append({
                         "subreddit": sub,
                         "title": d.get('title', ''),
                         "selftext": (d.get('selftext') or '')[:200],
                         "score": d.get('score', 0),
                         "num_comments": d.get('num_comments', 0),
                     })
-        time.sleep(0.4)
+        return out
+
+    # 4 并发足够,Reddit 对未登录-like 流量在 8+ 并发开始限流
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for fut in as_completed(ex.submit(_fetch_sub, s) for s in SIGNAL_SUBREDDITS):
+            all_posts.extend(fut.result())
     print(f"   抓到 {len(all_posts)} 条原始信号", flush=True)
 
     if not all_posts:
@@ -356,7 +364,10 @@ def score_reddit_candidate(candidate, cookie_str):
 
     BUYER_SIGNALS = ["recommend", "wish there", "best for", "looking for",
                       "problem with", "frustrated", "issue with", "anyone tried",
-                      "should i buy", "vs", "or", "review"]
+                      "should i buy", "anyone use", "what brand", "any good",
+                      "worth it", "vs.", "review of", "comparison"]
+    # 注意:不要用 "or"/"vs"/"review" 这种短词做子串匹配,会被 "for"/"before"/"works" 误命中,
+    # 把宠物情感帖也打成"含买家信号"。要么换成多词短语,要么用正则词边界。
     total_score = sum(p.get('score', 0) for p in posts)
     total_comments = sum(p.get('num_comments', 0) for p in posts)
     buyer_signal = sum(
@@ -393,15 +404,18 @@ def reddit_driven_pick(seen_products, last_5_names, cookie_str):
     if not candidates:
         return None, []
 
-    print("📊 候选打分（近 30 天 Reddit 讨论密度）...", flush=True)
-    ranked = []
-    for c in candidates:
-        score, stats = score_reddit_candidate(c, cookie_str)
-        c["score"] = score
-        c["stats"] = stats
-        ranked.append(c)
-        print(f"   · {c['direction']:<35} 分 {score:>6.1f}  | {stats['posts_30d']:>3} 帖, {stats['total_score']:>6} 赞, 信号词 {stats['buyer_signal_pct']}%")
-        time.sleep(0.3)
+    print("📊 候选打分（近 30 天 Reddit 讨论密度,并行）...", flush=True)
+    # 4 并发,10 个候选打分由 ~30s 串行 → ~10s 并行
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        future_to_cand = {ex.submit(score_reddit_candidate, c, cookie_str): c for c in candidates}
+        ranked = []
+        for fut in as_completed(future_to_cand):
+            c = future_to_cand[fut]
+            score, stats = fut.result()
+            c["score"] = score
+            c["stats"] = stats
+            ranked.append(c)
+            print(f"   · {c['direction']:<35} 分 {score:>6.1f}  | {stats['posts_30d']:>3} 帖, {stats['total_score']:>6} 赞, 信号词 {stats['buyer_signal_pct']}%")
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
     print(f"\n🥇 Top 候选：{ranked[0]['direction']}（{ranked[0]['category']}，分 {ranked[0]['score']}）", flush=True)
@@ -414,15 +428,25 @@ def generate_data_driven_reason(direction, amazon_info, reddit_stats, ranked_can
     优于 pick_fresh_direction 给的"避开 X 品类"机械理由。
     """
     amz_block = ""
+    amz_insufficient = False
     if amazon_info:
         kw = amazon_info.get("keyword_market", [])
         kw_text = " | ".join(
             f"'{k['keyword']}': 月搜{k.get('monthly_searches','?')}, 增长{k.get('growth_pct','?')}%, 供需比{k.get('supply_demand_ratio','?')}, 均价${k.get('avg_price','?')}"
             for k in kw[:2]
         )
-        top_brands = list({s.get("brand") for s in amazon_info.get("top_skus", [])[:5] if s.get("brand")})
-        top_units = sum((s.get("units_monthly") or 0) for s in amazon_info.get("top_skus", [])[:3])
-        amz_block = f"""
+        top_skus = amazon_info.get("top_skus", []) or []
+        top_brands = list({s.get("brand") for s in top_skus[:5] if s.get("brand")})
+        top_units = sum((s.get("units_monthly") or 0) for s in top_skus[:3])
+        # 防脑补：Amazon 数据不足时,显式标记,prompt 里禁止虚构市场结论
+        if len(top_skus) == 0:
+            amz_insufficient = True
+            amz_block = f"""
+- Amazon 类目: {amazon_info.get('category','?').split(':')[-1]}（{amazon_info.get('category_products_total','?')} 商品）
+- ⚠️ Top SKU 数据为 0(关键词过滤后无匹配 / 类目错位等),**Amazon 验证未完成,本次理由不要从 Amazon 角度论证供需关系**
+- 关键词数据: {kw_text or '无'}"""
+        else:
+            amz_block = f"""
 - Amazon 类目: {amazon_info.get('category','?').split(':')[-1]}（{amazon_info.get('category_products_total','?')} 商品）
 - 关键词数据: {kw_text}
 - Top 3 品牌月销合计: {top_units:,} 单
@@ -452,6 +476,7 @@ def generate_data_driven_reason(direction, amazon_info, reddit_stats, ranked_can
 - **必须引用具体数据**（候选排名 / 帖数 / 赞数 / 买家信号比例 / Amazon 月销 / 增长率等）
 - **如果有"候选排名"数据，必须解释"为什么是它而不是其他候选"**（这是真正的事前依据）
 - 不要说"避开 X 品类"或"季节合适"
+- {"⚠️ Amazon 数据不足(Top SKU=0),只用 Reddit 数据论证,不要虚构亚马逊月销/供需缺口/市场规模" if amz_insufficient else "Reddit 与 Amazon 数据可结合论证"}
 - 专业克制，不鸡汤
 - 中文 80-130 字
 
@@ -621,7 +646,9 @@ def main():
     cookie_str = get_cookies()
 
     # 重试：选 Top 1 → 跑深度分析；失败则取候选 Top 2/3...
-    MAX_RETRIES = 3
+    # 候选打分用宽松全站搜,深度分析用精准版块+核心词,口径不一致会让 niche 长尾候选打分高但深度搜空,
+    # 因此 MAX_RETRIES 必须给足(候选池总数 10),否则前几个 niche 候选连续失败就提前终止。
+    MAX_RETRIES = 6
     failed_directions = []
     ranked_candidates = None
 

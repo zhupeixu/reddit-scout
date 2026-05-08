@@ -222,8 +222,8 @@ def discover_subreddits_by_name(keyword, cookie_str, top_n=10):
     out = []
     for item in data['data']['children']:
         d = item['data']
-        # 过滤掉用户太少的死版块
-        if d.get('subscribers', 0) < 1000:
+        # 过滤掉用户太少的死版块（兼容 subscribers 为 None 的情况）
+        if (d.get('subscribers') or 0) < 1000:
             continue
         out.append({
             "subreddit": d.get('display_name'),
